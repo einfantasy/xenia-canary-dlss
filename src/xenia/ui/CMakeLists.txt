@@ -22,3 +22,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # variable font that stb_truetype cannot load (see LoadJapaneseFont).
   xe_embed_binary_assets(xenia-ui "${PROJECT_SOURCE_DIR}/assets/font" font)
 endif()
+
+if(XENIA_BUILD_TESTS)
+  set(CMAKE_FOLDER "tests")
+  add_subdirectory(testing)
+endif()

@@ -336,7 +336,7 @@ class Presenter {
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
 
- protected:
+ public:
   enum class PaintResult {
     kPresented,
     kPresentedSuboptimal,
@@ -492,6 +492,7 @@ class Presenter {
     }
   };
 
+ protected:
   struct BilinearConstants {
     int32_t output_offset[2];
     float output_size_inv[2];

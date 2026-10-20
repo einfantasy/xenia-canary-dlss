@@ -2,6 +2,7 @@
 
 > 状态：架构设计稿（DESIGN），**用户已正式批准**（2026-10-20，决策 1–7，见 §L3）。
 > 本阶段**仅做只读分析、证据核查、架构设计、文档编写**。未实现任何代码、未构建、未加载 DLL、未执行 GPU 操作、未创建 Mock。
+> **当前进度**：Milestone 1 架构已批准；**Milestone 2 已完成并正式验收**（最小后端接口骨架、默认关闭配置、独立结果契约、原始路径回退构造器、路径选择函数与主机侧测试 15 用例 / 45 断言全部交付，独立交付审查结论 `PASS WITH FINDINGS`）。详见 `docs/dlss-integration/milestone-2-audit.md`。
 > 证据标签约定：`STATIC_VERIFIED`（当前源码已核实）｜`SDK-DOC-SUPPORTED`（SDK 文档/头文件支持）｜`DESIGN PROPOSAL`（本设计建议）｜`UNVERIFIED`（未验证）｜`RUNTIME_VERIFIED_ON_RTX4090`（仅在真实 RTX 4090 证据存在时使用——本阶段**无任何**项可用）。
 
 ---
@@ -534,12 +535,12 @@ flowchart TB
 - 任务：完成架构文档并等待用户审核。**已完成**，用户已正式批准（决策 1–7，见 §L3）。
 - 停止点：文档完成即停止，**不**自动进入 Milestone 2。
 
-### K2. Milestone 2：最小接口骨架与主机侧测试（架构已批准；启动待用户明确指示）
-- 可能包括：最小后端接口（`IDLSSSuperSamplingBackend`）、默认关闭配置（`GuestOutputEnhancementConfig`）、独立处理结果契约（`BackendResult`）、原始路径回退测试、必要的编译与静态验证。
-- **不**在此阶段宣称真实 DLSS 已可用。
-- 修改范围：仅 Presenter/后端管理层接口与静态检查，不触及上游渲染。
-- 验收条件：构建通过（届时方可标 `COMPILE_VERIFIED`）；主开关默认关闭；单测验证回退到原始效果链（`effect_count ≥ 1` + `kBilinear`），`effect_count = 0` 不用于回退；零 GPU 依赖、零 DLL 加载。
-- 停止点：完成本步后停止。
+### K2. Milestone 2：最小接口骨架与主机侧测试（**已完成，2026-10-20 正式验收**）
+- 交付物：最小后端接口（`IDLSSSuperSamplingBackend`：`IsAvailable` / `TryProcess` / `Shutdown`）、默认关闭配置（`GuestOutputEnhancementConfig`，主开关 + SR 子开关均默认 OFF）、独立处理结果契约（`BackendResult` 九状态枚举，与 `PaintResult` 正交）、原始路径回退构造器（`BuildOriginalPathFallbackFlow`：`effect_count = 1`、`effects[0] = kBilinear`，严禁 `effect_count = 0`）、路径选择函数（`SelectOutputPath`，生产接线推迟至 M3）、主机侧测试（`src/xenia/ui/testing/`，15 用例 / 45 断言，全部通过）。
+- 独立交付审查结论：`PASS WITH FINDINGS`；唯一阻塞级发现 F3（注释措辞把未实现的互斥保护描述为已完成）已在收尾阶段修正；其余项（`SelectOutputPath` 无生产调用者、`IsAvailable()` 未使用、回退构造器为最小实现）均属 M3 集成项，不构成 M2 阻塞。
+- 验收条件全部满足：全量 Release 构建通过（`COMPILE_VERIFIED`）；主开关默认关闭；单测验证回退到原始效果链（`effect_count = 1` + `kBilinear`），`effect_count = 0` 不用于回退；零 GPU 依赖、零 DLL 加载。
+- 详见 `docs/dlss-integration/milestone-2-audit.md`。
+- 停止点：完成本步后停止（**不**自动进入 Milestone 3）。
 
 ### K3. Milestone 3：DLSS SR 后端接入（接口骨架与资源契约稳定后）
 - 独立处理：SDK 版本兼容、DLL 加载策略、D3D12 资源状态与同步、失败回退、RTX 4090 实机验证。
@@ -548,11 +549,35 @@ flowchart TB
 - 停止点：SR 版本稳定后停止。
 
 ### K4. 后续独立阶段
-- NVOF（独立 MV 模块）。
-- 帧生成（需相机矩阵/MV/UI 分离/时序改造）。
-- 实验性神经渲染及其他功能。
-- 这些模块**不**成为首个 DLSS SR 版本的强制依赖。
-- 每个阶段必须列出修改范围、验收条件和停止点。不得因制定计划而提前执行。
+#### K4.1. Milestone 4：NVOF 独立集成与可行性验证
+- 目标： 评估并独立集成 NVIDIA Optical Flow SDK，验证 D3D12 资源注册、光流执行、资源状态转换、GPU 同步及输出有效性。
+- 前置条件： DLSS SR 已完成独立验证；已确认目标 SDK、驱动和运行时的兼容性。
+- 修改范围： 独立的 Optical Flow 模块及必要的 D3D12 集成点。未经单独批准，不修改 Xenia 上游渲染流程。
+- 约束： NVOF 估算的光流不等同于游戏原生运动矢量（Motion Vectors，MV），不得未经验证就将两者互相替代。
+- 验收条件： 接口契约、资源生命周期、同步与失败回退通过验证；真实 GPU 执行必须在受支持的 NVIDIA 硬件环境中单独验证。
+- 停止点： 完成独立验收后停止，等待用户审核。
+
+#### K4.2. Milestone 5：Frame Generation（FG）可行性研究与集成
+- 目标： 确认目标 FG 技术及 SDK 的实际输入契约，并评估 Xenia 当前渲染链路是否满足要求。
+- 前置条件： 已完成 SDK/API 能力核验；已评估运动矢量、深度、帧时序、UI 分离、呈现队列和同步要求。
+- 修改范围： 经审核批准的帧生成模块及必要的呈现链路改造。不得预先假设只需增加一个后处理效果即可实现 FG。
+- 验收条件： 输入数据与时序契约明确；失败时能够安全回退；在目标 NVIDIA 硬件上完成实际功能验证后，才能宣称 FG 可用。
+- 停止点： 可行性研究和实现分别设置审核点；每一步完成后停止，等待用户审核。
+
+#### K4.3. Milestone 6：实验性神经渲染（NR / DLSS 5）研究与可行性验证
+- 目标： 核验实际可用的 SDK/API、模型与运行时要求、所需场景数据、输入契约和许可条件，判断能否与 Xenia 的渲染架构集成。
+- 前置条件： 已获得足够的官方技术资料，并确认拟使用组件的来源、版本及合法使用条件。
+- 修改范围： 初期仅限只读研究、技术验证和独立实验分支；在用户明确批准之前，不修改主线集成代码。
+- 约束： 不得仅凭“DLSS 5”名称推断当前 SDK 已公开提供全部所需功能；社区构建或未经验证的 DLL 不得作为正式主线依赖。
+- 验收条件： 形成可行性结论、API/输入契约清单、依赖与许可风险清单，以及明确的继续或终止建议。
+- 停止点： 研究报告完成后停止。实际集成须另行批准。
+
+#### K4.4. 跨阶段约束
+- 首个 DLSS SR 版本不强制依赖 NVOF、FG 或 NR。
+- NVOF、FG、NR 均为独立阶段，不能因为规划完成而自动启动。
+- 不预先保证上述阶段一定可实现；应以实际 SDK 能力、Xenia 架构兼容性、许可证条件和硬件验证结果决定是否继续。
+- 每个阶段必须列出修改范围、验收条件、环境限制、风险和停止点，并提供 A–G 验收报告。
+- 在 Hyper-V 等无法进行真实 NVIDIA GPU 验证的环境中，相关功能必须标记为 RUNTIME_UNVERIFIED，不得将静态检查或 Mock 测试表述为真实 GPU 功能已通过验证。
 
 ---
 
@@ -601,4 +626,4 @@ flowchart TB
 - NVOF：`C:\SDKs\NVIDIA\Optical_Flow_SDK_5.0.7\Doc\NVOFA_Programming_Guide.pdf`、`NVOFA_FRUC.pdf`、`NVOFA_Tracker.pdf`。
 - 运行时：`\\ein-9900k\Code\DLSS5_Research\runtime\experimental\release-runtime-manifest.json`（SR 310.9.1.0 官方、FG 310.9.1.0 官方、RR 310.9.1.0 官方、NR 310.8.3.0 社区 Lecram HashMismatch、NR 310.8.0.0 用户批准 NVIDIA 原始 Valid）。
 - 参考：`\\ein-9900k\Code\DLSS5_Research\nvidia-dlss-reference\`（00-09 系列）、`\\ein-9900k\Code\DLSS5_Research\Veyra-NRVideo\`（只读架构参考）。
-- 审计：`docs/dlss-integration/milestone-0-audit.md`、`milestone-0.1-baseline-review.md`、`milestone-0.2-feasibility-review.md`。
+- 审计：`docs/dlss-integration/milestone-0-audit.md`、`milestone-0.1-baseline-review.md`、`milestone-0.2-feasibility-review.md`、`milestone-2-audit.md`。
