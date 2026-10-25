@@ -40,8 +40,12 @@
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xconfig.h"
+#if XE_PLATFORM_WIN32
+#include "xenia/ui/d3d12/d3d12_presenter.h"
+#endif
 #include "xenia/ui/file_picker.h"
 #include "xenia/ui/graphics_provider.h"
+#include "xenia/ui/guest_output_enhancement.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/imgui_host_notification.h"
@@ -134,6 +138,62 @@ DEFINE_double(
     "stops.\n"
     "Lower is sharper.",
     "Display");
+DEFINE_bool(
+    dlss_enabled, false,
+    "Master switch for the NVIDIA DLSS enhancement path (D3D12 presenter "
+    "only). When false, no DLSS backend is requested, no NVIDIA runtime DLL "
+    "is loaded, and no extra GPU steps are performed.\n"
+    "This is an independent enhancement path, not mutually exclusive with "
+    "FSR/CAS resampling.",
+    "Display");
+DEFINE_bool(
+    dlss_sr_enabled, false,
+    "DLSS Super Resolution sub-switch. Only effective when dlss_enabled is "
+    "true. When enabled together with the master switch, the D3D12 presenter "
+    "lazily creates the DLSS SR backend on the first frame; if the NVIDIA "
+    "runtime is missing or initialization fails, it deterministically falls "
+    "back to the original render path.",
+    "Display");
+DEFINE_string(
+    dlss_sr_perf_quality, "balanced",
+    "DLSS Super Resolution quality preset. Only effective when dlss_sr_enabled "
+    "is true. Use: [maxperf, balanced, maxquality, ultraperformance, "
+    "ultraperformance]\n"
+    " maxperf:\n"
+    "  Fastest preset, lowest quality.\n"
+    " balanced (default):\n"
+    "  Balanced speed and quality.\n"
+    " maxquality:\n"
+    "  Highest quality of the standard presets.\n"
+    " ultraperformance:\n"
+    "  Extended fastest preset.\n"
+    "Changing the preset rebuilds the DLSS backend (CreateFeature is a GPU "
+    "command), which takes effect on the next frame. Unknown values (including "
+    "ultraquality, which the current DLSS runtime does not support) fall back "
+    "to balanced.",
+    "Display");
+  DEFINE_string(
+      dlss_sr_render_preset, "default",
+      "DLSS Super Resolution render preset (the model hint, one value per "
+      "quality mode). Only effective when dlss_sr_enabled is true. Use: "
+      "[default, j, k, l, m]\n"
+      " default:\n"
+      "  Do not send the hint; the SDK uses each quality mode's default "
+      "preset (identical to the previous behavior).\n"
+      " j:\n"
+      "  Similar to k; slightly less ghosting at the cost of extra "
+      "flickering. k is generally recommended over j.\n"
+      " k:\n"
+      "  The default preset for DLAA/balanced/quality modes; best image "
+      "quality at a higher performance cost.\n"
+      " l:\n"
+      "  The default preset for ultra-performance mode.\n"
+      " m:\n"
+      "  The default preset for performance (maxperf) mode.\n"
+      "Changing the preset rebuilds the DLSS backend (CreateFeature is a GPU "
+      "command), which takes effect on the next frame. Unknown values fall "
+      "back to default.",
+      "Display");
 // Dithering to 8bpc is enabled by default since the effect is minor, only
 // effects what can't be shown normally by host displays, and nothing is changed
 // by it for 8bpc source without resampling.
@@ -168,6 +228,66 @@ using namespace xe::gpu;
 
 constexpr std::string_view kRecentlyPlayedTitlesFilename = "recent.toml";
 constexpr std::string_view kBaseTitle = "Xenia-canary";
+
+// Display name of a DLSS SR quality preset for the ImGui slider label.
+// File-local: the UI layer never exposes the SDK enum (license isolation).
+static const char* GetDlssSrPerfQualityName(ui::DlssSrPerfQuality quality) {
+  switch (quality) {
+    case ui::DlssSrPerfQuality::kMaxPerf:
+      return "MaxPerf";
+    case ui::DlssSrPerfQuality::kBalanced:
+      return "Balanced";
+    case ui::DlssSrPerfQuality::kMaxQuality:
+      return "MaxQuality";
+    case ui::DlssSrPerfQuality::kUltraPerformance:
+      return "UltraPerformance";
+  }
+  return "Balanced";
+}
+
+  // Display name of a DLSS SR render preset for the ImGui slider label.
+  // File-local: the UI layer never exposes the SDK enum (license isolation).
+  static const char* GetDlssSrRenderPresetName(ui::DlssSrRenderPreset preset) {
+    switch (preset) {
+      case ui::DlssSrRenderPreset::kDefault:
+        return "Default";
+      case ui::DlssSrRenderPreset::kJ:
+        return "J";
+      case ui::DlssSrRenderPreset::kK:
+        return "K";
+      case ui::DlssSrRenderPreset::kL:
+        return "L";
+      case ui::DlssSrRenderPreset::kM:
+        return "M";
+    }
+    return "Default";
+  }
+
+  // The render-preset options in slider order (index 0 is the default). The
+  // enum values are the SDK header's explicit numeric values (0/10/11/12/13,
+  // non-contiguous), so the slider operates on an index into this table, not
+  // on the raw value.
+  static const ui::DlssSrRenderPreset kDlssSrRenderPresetOptions[] = {
+      ui::DlssSrRenderPreset::kDefault, ui::DlssSrRenderPreset::kJ,
+      ui::DlssSrRenderPreset::kK, ui::DlssSrRenderPreset::kL,
+      ui::DlssSrRenderPreset::kM};
+  static_assert(sizeof(kDlssSrRenderPresetOptions) /
+                    sizeof(kDlssSrRenderPresetOptions[0]) == 5,
+                "one option per render preset");
+
+  // Index into kDlssSrRenderPresetOptions for the given preset. A value that is
+  // not in the table (a stale or invalid config) maps to index 0 (kDefault).
+  static int DlssSrRenderPresetIndex(ui::DlssSrRenderPreset preset) {
+    const size_t option_count =
+        sizeof(kDlssSrRenderPresetOptions) /
+        sizeof(kDlssSrRenderPresetOptions[0]);
+    for (size_t i = 0; i < option_count; ++i) {
+      if (kDlssSrRenderPresetOptions[i] == preset) {
+        return static_cast<int>(i);
+      }
+    }
+    return 0;
+  }
 
 EmulatorWindow::EmulatorWindow(Emulator* emulator,
                                ui::WindowedAppContext& app_context,
@@ -410,11 +530,35 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
     ui::Presenter::GuestOutputPaintConfig new_presenter_config =
         current_presenter_config;
 
+#if XE_PLATFORM_WIN32
+    // The DLSS enhancement backend exists only on the D3D12 presenter. Read
+    // the current enhancement config once (read-modify-write pattern, like the
+    // paint config) so the checkboxes below can modify it.
+    auto* d3d12_presenter =
+        dynamic_cast<ui::d3d12::D3D12Presenter*>(presenter);
+    ui::GuestOutputEnhancementConfig new_enhancement_config;
+    if (d3d12_presenter) {
+      new_enhancement_config =
+          d3d12_presenter->GetGuestOutputEnhancementConfigFromUIThread();
+    }
+#endif
+
     if (ImGui::TreeNodeEx(
             "Resampling and sharpening",
             ImGuiTreeNodeFlags_Framed | ImGuiTreeNodeFlags_DefaultOpen)) {
-      // Filtering effect.
+      // Resampling effect selection. The options are mutually exclusive: each
+      // is a complete resampling / super-sampling method. NVIDIA DLSS (D3D12
+      // presenter only) is a fourth radio option; when selected it forces the
+      // FSR/CAS paint effect to bilinear so the DLSS output is not double-
+      // resampled by FSR/CAS.
       int new_effect_index = int(new_presenter_config.GetEffect());
+#if XE_PLATFORM_WIN32
+      // If the DLSS master is on, DLSS is the active resampling method. Value 3
+      // is outside the Effect enum range (0-2) and marks the DLSS radio.
+      if (d3d12_presenter && new_enhancement_config.master_enabled) {
+        new_effect_index = 3;
+      }
+#endif
       ImGui::RadioButton(
           "None / Bilinear", &new_effect_index,
           int(ui::Presenter::GuestOutputPaintConfig::Effect::kBilinear));
@@ -425,8 +569,80 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
       ImGui::RadioButton(
           "AMD FidelityFX Super Resolution 1.0 (FSR)", &new_effect_index,
           int(ui::Presenter::GuestOutputPaintConfig::Effect::kFsr));
+#if XE_PLATFORM_WIN32
+      if (d3d12_presenter) {
+        ImGui::RadioButton("NVIDIA DLSS", &new_effect_index, 3);
+      }
+#endif
+      // Sync the configs from the radio selection. DLSS (index 3) enables the
+      // DLSS master and forces the paint effect to bilinear (no double
+      // resampling); any other option disables the DLSS master and sets the
+      // paint effect accordingly.
+#if XE_PLATFORM_WIN32
+      if (d3d12_presenter) {
+        new_enhancement_config.master_enabled = (new_effect_index == 3);
+        if (new_effect_index == 3) {
+          new_effect_index =
+              int(ui::Presenter::GuestOutputPaintConfig::Effect::kBilinear);
+        }
+      }
+#endif
       new_presenter_config.SetEffect(
           ui::Presenter::GuestOutputPaintConfig::Effect(new_effect_index));
+#if XE_PLATFORM_WIN32
+      // The SR sub-switch is only drawn (and only changeable) while the DLSS
+      // radio is selected (master on). When the master is off, the sub-switch
+      // keeps its value and cannot trigger backend creation (effective SR
+      // request = master && sub).
+      if (d3d12_presenter && new_enhancement_config.master_enabled) {
+        bool new_dlss_sr = new_enhancement_config.super_sampling_enabled;
+        ImGui::Checkbox("Super Resolution", &new_dlss_sr);
+        new_enhancement_config.super_sampling_enabled = new_dlss_sr;
+        // The quality slider is only drawn (and only changeable) while the SR
+        // sub-switch is on; when the sub-switch is off the value is retained
+        // as-is (same semantics as the sub-switch when the master is off).
+        if (new_enhancement_config.super_sampling_enabled) {
+          int new_dlss_quality = static_cast<int>(
+              new_enhancement_config.perf_quality);
+          ImGui::TextUnformatted(
+              "DLSS SR quality preset (lower is faster, higher is higher "
+              "quality; changing it rebuilds the DLSS backend):");
+          ImGui::SliderInt("##DLSSSrPerfQuality", &new_dlss_quality, 0, 3,
+                           GetDlssSrPerfQualityName(
+                               static_cast<ui::DlssSrPerfQuality>(
+                                   new_dlss_quality)),
+                           ImGuiSliderFlags_NoInput);
+          ImGui::SameLine();
+          if (ImGui::Button("Reset##ResetDLSSSrPerfQuality")) {
+            new_dlss_quality = static_cast<int>(
+                ui::DlssSrPerfQuality::kBalanced);
+          }
+          new_enhancement_config.perf_quality =
+              static_cast<ui::DlssSrPerfQuality>(new_dlss_quality);
+
+            // The render-preset selector is only drawn (and only changeable)
+            // while the SR sub-switch is on (same semantics as the quality
+            // slider). Index into kDlssSrRenderPresetOptions (the enum values
+            // are non-contiguous, so the slider cannot use them directly).
+            int new_dlss_render_preset_index = DlssSrRenderPresetIndex(
+                new_enhancement_config.render_preset);
+            ImGui::TextUnformatted(
+                "DLSS SR render preset (per-quality-mode model hint; changing "
+                "it rebuilds the DLSS backend):");
+            ImGui::SliderInt(
+                "##DLSSSrRenderPreset", &new_dlss_render_preset_index, 0, 4,
+                GetDlssSrRenderPresetName(
+                    kDlssSrRenderPresetOptions[new_dlss_render_preset_index]),
+                ImGuiSliderFlags_NoInput);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset##ResetDLSSSrRenderPreset")) {
+              new_dlss_render_preset_index = 0;  // kDefault.
+            }
+            new_enhancement_config.render_preset =
+                kDlssSrRenderPresetOptions[new_dlss_render_preset_index];
+        }
+      }
+#endif
 
       // effect_description must be one complete, but short enough, sentence per
       // line, as TextWrapped doesn't work correctly in auto-resizing windows
@@ -556,6 +772,50 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
     }
 
     presenter->SetGuestOutputPaintConfigFromUIThread(new_presenter_config);
+
+#if XE_PLATFORM_WIN32
+    // Write the DLSS enhancement config to the D3D12 presenter and override its
+    // cvars to persist them at exit.
+    if (d3d12_presenter) {
+      d3d12_presenter->SetGuestOutputEnhancementConfigFromUIThread(
+          new_enhancement_config);
+      ui::GuestOutputEnhancementConfig cvars_enhancement_config =
+          GetGuestOutputEnhancementConfigForCvars();
+      if (cvars_enhancement_config.master_enabled !=
+          new_enhancement_config.master_enabled) {
+        OVERRIDE_bool(dlss_enabled, new_enhancement_config.master_enabled);
+      }
+      // Only persist the SR sub-switch when the master is on (the sub-checkbox
+      // is only drawn and changeable in that case). When the master is off the
+      // sub-switch value is retained as-is.
+      if (new_enhancement_config.master_enabled &&
+          cvars_enhancement_config.super_sampling_enabled !=
+              new_enhancement_config.super_sampling_enabled) {
+        OVERRIDE_bool(dlss_sr_enabled,
+                      new_enhancement_config.super_sampling_enabled);
+      }
+      // Only persist the SR quality preset while the SR sub-switch is on (the
+      // slider is only drawn and changeable in that case).
+      if (new_enhancement_config.master_enabled &&
+          new_enhancement_config.super_sampling_enabled &&
+          cvars_enhancement_config.perf_quality !=
+              new_enhancement_config.perf_quality) {
+        OVERRIDE_string(dlss_sr_perf_quality,
+                        GetCvarValueForDlssSrPerfQuality(
+                            new_enhancement_config.perf_quality));
+      }
+        // Only persist the SR render preset while the SR sub-switch is on
+        // (the selector is only drawn and changeable in that case).
+        if (new_enhancement_config.master_enabled &&
+            new_enhancement_config.super_sampling_enabled &&
+            cvars_enhancement_config.render_preset !=
+                new_enhancement_config.render_preset) {
+          OVERRIDE_string(dlss_sr_render_preset,
+                          GetCvarValueForDlssSrRenderPreset(
+                              new_enhancement_config.render_preset));
+        }
+    }
+#endif
 
     // Override the values in the cvars to save them to the config at exit if
     // the user has set them to anything new.
@@ -1019,6 +1279,95 @@ EmulatorWindow::GetGuestOutputPaintConfigForCvars() {
   return paint_config;
 }
 
+const char* EmulatorWindow::GetCvarValueForDlssSrPerfQuality(
+    ui::DlssSrPerfQuality perf_quality) {
+  switch (perf_quality) {
+    case ui::DlssSrPerfQuality::kMaxPerf:
+      return "maxperf";
+    case ui::DlssSrPerfQuality::kBalanced:
+      return "balanced";
+    case ui::DlssSrPerfQuality::kMaxQuality:
+      return "maxquality";
+    case ui::DlssSrPerfQuality::kUltraPerformance:
+      return "ultraperformance";
+  }
+  return "balanced";
+}
+
+ui::DlssSrPerfQuality EmulatorWindow::GetDlssSrPerfQualityForCvarValue(
+    const std::string& cvar_value) {
+  if (cvar_value ==
+      GetCvarValueForDlssSrPerfQuality(ui::DlssSrPerfQuality::kMaxPerf)) {
+    return ui::DlssSrPerfQuality::kMaxPerf;
+  }
+  if (cvar_value ==
+      GetCvarValueForDlssSrPerfQuality(ui::DlssSrPerfQuality::kBalanced)) {
+    return ui::DlssSrPerfQuality::kBalanced;
+  }
+  if (cvar_value ==
+      GetCvarValueForDlssSrPerfQuality(ui::DlssSrPerfQuality::kMaxQuality)) {
+    return ui::DlssSrPerfQuality::kMaxQuality;
+  }
+  if (cvar_value ==
+      GetCvarValueForDlssSrPerfQuality(ui::DlssSrPerfQuality::kUltraPerformance)) {
+    return ui::DlssSrPerfQuality::kUltraPerformance;
+  }
+  // Unknown value: fall back to the default preset (never a bogus value).
+  // "ultraquality" is unknown here on purpose: the current DLSS runtime does
+  // not support it, so a saved value of that name maps to balanced.
+  return ui::DlssSrPerfQuality::kBalanced;
+}
+
+  const char* EmulatorWindow::GetCvarValueForDlssSrRenderPreset(
+      ui::DlssSrRenderPreset render_preset) {
+    switch (render_preset) {
+      case ui::DlssSrRenderPreset::kDefault:
+        return "default";
+      case ui::DlssSrRenderPreset::kJ:
+        return "j";
+      case ui::DlssSrRenderPreset::kK:
+        return "k";
+      case ui::DlssSrRenderPreset::kL:
+        return "l";
+      case ui::DlssSrRenderPreset::kM:
+        return "m";
+    }
+    return "default";
+  }
+
+  ui::DlssSrRenderPreset EmulatorWindow::GetDlssSrRenderPresetForCvarValue(
+      const std::string& cvar_value) {
+    if (cvar_value == GetCvarValueForDlssSrRenderPreset(ui::DlssSrRenderPreset::kJ)) {
+      return ui::DlssSrRenderPreset::kJ;
+    }
+    if (cvar_value == GetCvarValueForDlssSrRenderPreset(ui::DlssSrRenderPreset::kK)) {
+      return ui::DlssSrRenderPreset::kK;
+    }
+    if (cvar_value == GetCvarValueForDlssSrRenderPreset(ui::DlssSrRenderPreset::kL)) {
+      return ui::DlssSrRenderPreset::kL;
+    }
+    if (cvar_value == GetCvarValueForDlssSrRenderPreset(ui::DlssSrRenderPreset::kM)) {
+      return ui::DlssSrRenderPreset::kM;
+    }
+    // Unknown value: fall back to kDefault (never send a bogus preset to the
+    // SDK). This is the behavior-neutral choice.
+    return ui::DlssSrRenderPreset::kDefault;
+  }
+
+ui::GuestOutputEnhancementConfig
+EmulatorWindow::GetGuestOutputEnhancementConfigForCvars() {
+  ui::GuestOutputEnhancementConfig enhancement_config;
+  enhancement_config.master_enabled = cvars::dlss_enabled;
+  enhancement_config.super_sampling_enabled = cvars::dlss_sr_enabled;
+  enhancement_config.perf_quality =
+      GetDlssSrPerfQualityForCvarValue(cvars::dlss_sr_perf_quality);
+    enhancement_config.render_preset =
+        GetDlssSrRenderPresetForCvarValue(cvars::dlss_sr_render_preset);
+  // NVOF / Frame Generation / experimental neural rendering sub-switches are
+  // not exposed in the UI yet (Phase 2+); keep them at their default-off.
+  return enhancement_config;
+}
+
 void EmulatorWindow::ApplyDisplayConfigForCvars() {
   gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
   if (!graphics_system) {
@@ -1036,6 +1385,14 @@ void EmulatorWindow::ApplyDisplayConfigForCvars() {
   if (presenter) {
     presenter->SetGuestOutputPaintConfigFromUIThread(
         GetGuestOutputPaintConfigForCvars());
+#if XE_PLATFORM_WIN32
+    // The DLSS enhancement config is only available on the D3D12 presenter.
+    if (auto* d3d12_presenter =
+            dynamic_cast<ui::d3d12::D3D12Presenter*>(presenter)) {
+      d3d12_presenter->SetGuestOutputEnhancementConfigFromUIThread(
+          GetGuestOutputEnhancementConfigForCvars());
+    }
+#endif
   }
 }
 

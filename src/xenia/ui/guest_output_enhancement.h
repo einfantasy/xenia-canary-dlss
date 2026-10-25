@@ -23,8 +23,64 @@
 
 #include "xenia/ui/presenter.h"
 
+// Forward declarations of the D3D12 types used by the backend interface.
+// The backend records its GPU commands (CreateFeature / EvaluateFeature and
+// the surrounding state-transition barriers) into the caller's command list,
+// and reads the guest output resource (borrowed, read-only). Keeping these as
+// forward-declared pointers avoids pulling the full d3d12.h into this header.
+struct ID3D12GraphicsCommandList;
+struct ID3D12Resource;
+
 namespace xe {
 namespace ui {
+
+// ---------------------------------------------------------------------------
+// DlssSrPerfQuality
+//
+// Xenia-side subset of NVSDK_NGX_PerfQuality_Value (DLSS SDK 310.9.1,
+// nvsdk_ngx_defs.h:251-260). The UI/config layer never includes any nvsdk_*
+// header (license isolation: SDK dependencies are confined to the dlss/*
+// module); the backend maps this value to the SDK enum at feature creation.
+// Two SDK values are intentionally absent:
+//   - UltraQuality (=4): not supported by the current DLSS runtime version;
+//     the UI does not expose it and the backend never sends it.
+//   - DLAA (=5): means input size == output size (1.0 scaling), which has no
+//     meaning for the guest output path.
+// ---------------------------------------------------------------------------
+enum class DlssSrPerfQuality : uint8_t {
+  kMaxPerf = 0,
+  kBalanced = 1,
+  kMaxQuality = 2,
+  kUltraPerformance = 3,
+};
+
+// ---------------------------------------------------------------------------
+// DlssSrRenderPreset
+//
+// Xenia-side subset of NVSDK_NGX_DLSS_Hint_Render_Preset (DLSS SDK 310.9.1,
+// nvsdk_ngx_defs.h:70-88). The values are the SDK header's EXPLICIT numeric
+// values (0/10/11/12/13), NOT a contiguous 0..4 ordering: the PDF's implicit
+// A..O letters occupy slots 1-15, and A-D (removed), E-F (deprecated), G-I
+// (reserved), and N-O (reserved) are all unusable. The UI/config layer never
+// includes any nvsdk_* header (license isolation: SDK dependencies are
+// confined to the dlss/* module); the backend maps this value to the SDK
+// parameter at feature creation. Only Default and the four current presets are
+// exposed:
+//   - kJ (=10): similar to K; slightly less ghosting at the cost of extra
+//     flickering. K is generally recommended over J.
+//   - kK (=11): default for DLAA/Balanced/Quality modes; best image quality.
+//   - kL (=12): default for Ultra Perf mode.
+//   - kM (=13): default for Perf mode.
+//   - kDefault (=0): "do not send the hint at all" - the SDK then resolves the
+//     mode's default preset (identical to the current verified baseline).
+// ---------------------------------------------------------------------------
+enum class DlssSrRenderPreset : uint8_t {
+  kDefault = 0,
+  kJ = 10,
+  kK = 11,
+  kL = 12,
+  kM = 13,
+};
 
 // ---------------------------------------------------------------------------
 // BackendResult
@@ -103,6 +159,21 @@ struct GuestOutputEnhancementConfig {
   // NVIDIA Optical Flow sub-switch (independent module; not a dependency of SR).
   bool optical_flow_enabled = false;
 
+  // DLSS SR quality preset (create-time parameter of the SDK feature). Only
+  // meaningful when super_sampling_enabled (and master_enabled). The preset is
+  // baked into CreateFeature, so changing it requires a backend rebuild.
+  // The default is kBalanced to match the backend's former hardcoded value, so
+  // enabling SR for the first time never triggers a rebuild.
+  DlssSrPerfQuality perf_quality = DlssSrPerfQuality::kBalanced;
+
+  // DLSS SR render preset (create-time parameter of the SDK feature, one value
+  // per quality mode). Only meaningful when super_sampling_enabled (and
+  // master_enabled). Like perf_quality it is baked into CreateFeature, so
+  // changing it requires a backend rebuild. kDefault (=0) means "do not send
+  // the hint at all" (the SDK resolves the mode's default preset), so the
+  // default is behavior-neutral versus the verified baseline.
+  DlssSrRenderPreset render_preset = DlssSrRenderPreset::kDefault;
+
   // Frame Generation sub-switch.
   bool frame_generation_enabled = false;
 
@@ -130,6 +201,24 @@ struct GuestOutputEnhancementConfig {
 // ---------------------------------------------------------------------------
 // IDLSSSuperSamplingBackend
 //
+// DlssSrFrameParams
+//
+// Per-frame parameters for the DLSS SR backend. These change per frame (the
+// jitter offset advances for temporal anti-aliasing; InReset is set on scene
+// changes) and are passed as call arguments to the backend's per-frame call,
+// NOT stored in a persistent config object. (See the architecture design,
+// section F1.)
+// ---------------------------------------------------------------------------
+struct DlssSrFrameParams {
+  // Jitter offset in input/render pixel space. Advances per frame.
+  float jitter_x = 0.0f;
+  float jitter_y = 0.0f;
+  // Set to true on a scene change; resets the backend's temporal history.
+  bool in_reset = false;
+};
+// ---------------------------------------------------------------------------
+// IDLSSSuperSamplingBackend
+//
 // The minimal DLSS SR backend interface. A real implementation (Milestone 3)
 // will own its own output textures and only borrow the guest output (read-only,
 // via SRV) - it never takes ownership of the guest output resource and never
@@ -149,10 +238,50 @@ class IDLSSSuperSamplingBackend {
 
   // Attempt to process one guest output frame. Returns a BackendResult: kSuccess,
   // or one of the specific failure reasons (kUnavailable, kInitFailed,
-  // kInputContractFailed, kSyncConditionFailed, kExecutionFailed, kOutputInvalid).
-  // The backend owns its own output and only borrows the guest output.
+  // kInputContractFailed, kSyncConditionFailed, kExecutionFailed,
+  // kOutputInvalid).
+  //
+  // The backend owns its own output texture and only borrows the guest output
+  // (read-only). It records its GPU work (the SDK CreateFeature /
+  // EvaluateFeature calls plus the surrounding state-transition barriers) into
+  // `command_list`. The command list is a recording buffer: it is only executed
+  // once at the end (ExecuteCommandLists). On failure the backend does NOT reset
+  // the command list itself - that is the presenter's responsibility (see the
+  // architecture design, section on command submission semantics).
+  //
+  // `guest_output` is the guest output resource to read (borrowed). Its size is
+  // given by `guest_output_properties.frontbuffer_width/height`. The backend
+  // output is written to a texture it owns, at `output_width` x `output_height`
+  // (the target resolution).
+  //
+  // `perf_quality` is the DLSS SR quality preset for this frame. It is a
+  // create-time parameter baked into the SDK's CreateFeature, so a change from
+  // the quality the feature was created with triggers a backend re-create
+  // (release + re-create), exactly like a change to the output size.
   virtual BackendResult TryProcess(
-      const Presenter::GuestOutputProperties& guest_output) = 0;
+      ID3D12GraphicsCommandList* command_list,
+      ID3D12Resource* guest_output,
+      uint32_t output_width,
+      uint32_t output_height,
+      const Presenter::GuestOutputProperties& guest_output_properties,
+      const DlssSrFrameParams& frame_params,
+      DlssSrPerfQuality perf_quality,
+      // `render_preset` is the DLSS SR render preset for this frame. Like
+      // `perf_quality` it is a create-time parameter (one value per quality
+      // mode), so a change from the preset the feature was created with
+      // triggers a backend re-create (release + re-create). kDefault (=0)
+      // means "do not send the hint" (the SDK resolves the mode's default
+      // preset).
+      DlssSrRenderPreset render_preset) = 0;
+
+  // The backend's owned output texture, valid after a successful TryProcess
+  // (the backend created it during initialization). The presenter uses these
+  // to create the SRV the first paint effect reads from. The default
+  // implementations return nullptr/0 so host-test stub backends need no
+  // overrides; the real DLSS backend overrides them.
+  virtual ID3D12Resource* OutputResource() const { return nullptr; }
+  virtual uint32_t OutputWidth() const { return 0; }
+  virtual uint32_t OutputHeight() const { return 0; }
 
   // Release backend-owned resources. The presenter never destroys backend
   // resources directly; this is the backend's responsibility.
@@ -193,7 +322,12 @@ void BuildOriginalPathFallbackFlow(Presenter::GuestOutputPaintFlow* flow,
 // ---------------------------------------------------------------------------
 BackendResult SelectOutputPath(const GuestOutputEnhancementConfig& config,
                                IDLSSSuperSamplingBackend* backend,
-                               const Presenter::GuestOutputProperties& guest_output,
+                               ID3D12GraphicsCommandList* command_list,
+                               ID3D12Resource* guest_output_resource,
+                               uint32_t output_width,
+                               uint32_t output_height,
+                               const Presenter::GuestOutputProperties& guest_output_properties,
+                               const DlssSrFrameParams& frame_params,
                                Presenter::GuestOutputPaintFlow* fallback_flow_out);
 
 }  // namespace ui

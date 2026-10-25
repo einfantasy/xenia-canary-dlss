@@ -3719,6 +3719,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   HRESULT device_removed_reason = device->GetDeviceRemovedReason();
   if (FAILED(device_removed_reason)) {
     device_removed_ = true;
+    // Log the raw HRESULT before it is collapsed into a bool downstream.
+    // Distinguishes a real GPU fault (e.g. 0x887A0005 device removed) from a
+    // TDR / hang, which is the key signal for the DLSS SR first-evaluate loss.
+    XELOGE("D3D12 device removed: GetDeviceRemovedReason() = 0x{:08X}",
+           static_cast<uint32_t>(device_removed_reason));
     graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
                                                  DXGI_ERROR_DEVICE_REMOVED);
     return false;

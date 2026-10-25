@@ -50,10 +50,28 @@ bool D3D12SharedMemory::Initialize() {
       provider.GetTiledResourcesTier() !=
           D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED &&
       !provider.GetGraphicsAnalysis()) {
-    if (FAILED(device->CreateReservedResource(
-            &buffer_desc, buffer_state_, nullptr, IID_PPV_ARGS(&buffer_)))) {
-      XELOGE("Shared memory: Failed to create the {} MB tiled buffer",
-             kBufferSize >> 20);
+    const HRESULT create_result = device->CreateReservedResource(
+        &buffer_desc, buffer_state_, nullptr, IID_PPV_ARGS(&buffer_));
+    if (FAILED(create_result)) {
+      XELOGE("Shared memory: Failed to create the {} MB tiled buffer "
+             "(HRESULT=0x{:08X})",
+             kBufferSize >> 20, static_cast<uint32_t>(create_result));
+      // Diagnostic (logging only): distinguish "device removed/broken" from a
+      // plain allocation failure (e.g. OOM). GetDeviceRemovedReason is a
+      // standard D3D12 query with no state change; the result feeds only this
+      // log line. graphics_analysis(PIX) being attached forces this branch.
+      const HRESULT removed_reason = device->GetDeviceRemovedReason();
+      XELOGE("Shared memory: GetDeviceRemovedReason() = 0x{:08X} ({}); "
+             "graphics_analysis(PIX) attached = {}.",
+             static_cast<uint32_t>(removed_reason),
+             removed_reason == DXGI_ERROR_DEVICE_REMOVED
+                 ? "DXGI_ERROR_DEVICE_REMOVED"
+                 : removed_reason == DXGI_ERROR_DEVICE_RESET
+                       ? "DXGI_ERROR_DEVICE_RESET"
+                       : removed_reason == S_OK
+                             ? "S_OK (device not removed)"
+                             : "other",
+             provider.GetGraphicsAnalysis() != nullptr);
       Shutdown();
       return false;
     }
@@ -73,12 +91,30 @@ bool D3D12SharedMemory::Initialize() {
           "This is caused by PIX being attached, which doesn't support tiled "
           "resources yet.");
     }
-    if (FAILED(device->CreateCommittedResource(
-            &ui::d3d12::util::kHeapPropertiesDefault,
-            provider.GetHeapFlagCreateNotZeroed(), &buffer_desc, buffer_state_,
-            nullptr, IID_PPV_ARGS(&buffer_)))) {
-      XELOGE("Shared memory: Failed to create the {} MB buffer",
-             kBufferSize >> 20);
+    const HRESULT create_result = device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesDefault,
+        provider.GetHeapFlagCreateNotZeroed(), &buffer_desc, buffer_state_,
+        nullptr, IID_PPV_ARGS(&buffer_));
+    if (FAILED(create_result)) {
+      XELOGE("Shared memory: Failed to create the {} MB buffer "
+             "(HRESULT=0x{:08X})",
+             kBufferSize >> 20, static_cast<uint32_t>(create_result));
+      // Diagnostic (logging only): distinguish "device removed/broken" from a
+      // plain allocation failure (e.g. OOM). GetDeviceRemovedReason is a
+      // standard D3D12 query with no state change; the result feeds only this
+      // log line. graphics_analysis(PIX) being attached forces this branch.
+      const HRESULT removed_reason = device->GetDeviceRemovedReason();
+      XELOGE("Shared memory: GetDeviceRemovedReason() = 0x{:08X} ({}); "
+             "graphics_analysis(PIX) attached = {}.",
+             static_cast<uint32_t>(removed_reason),
+             removed_reason == DXGI_ERROR_DEVICE_REMOVED
+                 ? "DXGI_ERROR_DEVICE_REMOVED"
+                 : removed_reason == DXGI_ERROR_DEVICE_RESET
+                       ? "DXGI_ERROR_DEVICE_RESET"
+                       : removed_reason == S_OK
+                             ? "S_OK (device not removed)"
+                             : "other",
+             provider.GetGraphicsAnalysis() != nullptr);
       Shutdown();
       return false;
     }

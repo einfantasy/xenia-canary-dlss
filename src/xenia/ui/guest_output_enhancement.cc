@@ -37,19 +37,27 @@ void BuildOriginalPathFallbackFlow(Presenter::GuestOutputPaintFlow* flow,
 
 BackendResult SelectOutputPath(const GuestOutputEnhancementConfig& config,
                                IDLSSSuperSamplingBackend* backend,
-                               const Presenter::GuestOutputProperties& guest_output,
+                               ID3D12GraphicsCommandList* command_list,
+                               ID3D12Resource* guest_output_resource,
+                               uint32_t output_width,
+                               uint32_t output_height,
+                               const Presenter::GuestOutputProperties& guest_output_properties,
+                               const DlssSrFrameParams& frame_params,
                                Presenter::GuestOutputPaintFlow* fallback_flow_out) {
   // 1. Not requested: master off, SR sub-switch off, or backend not initialized.
   //    The backend is never called in this case (no DLL load, no GPU work).
   if (!config.IsSuperSamplingRequested() || backend == nullptr) {
     if (fallback_flow_out) {
-      BuildOriginalPathFallbackFlow(fallback_flow_out, guest_output);
+      BuildOriginalPathFallbackFlow(fallback_flow_out, guest_output_properties);
     }
     return BackendResult::kNotRequested;
   }
 
   // 2. Requested: ask the backend to process the frame.
-  BackendResult result = backend->TryProcess(guest_output);
+  BackendResult result =
+      backend->TryProcess(command_list, guest_output_resource, output_width,
+                          output_height, guest_output_properties, frame_params,
+                            config.perf_quality, config.render_preset);
 
   // 3. Success: the backend produced usable output. Use the backend path.
   if (result == BackendResult::kSuccess) {
@@ -60,7 +68,7 @@ BackendResult SelectOutputPath(const GuestOutputEnhancementConfig& config,
   //    when it is one of the known failure states; otherwise normalize to the
   //    generic fallback state.
   if (fallback_flow_out) {
-    BuildOriginalPathFallbackFlow(fallback_flow_out, guest_output);
+    BuildOriginalPathFallbackFlow(fallback_flow_out, guest_output_properties);
   }
   switch (result) {
     case BackendResult::kUnavailable:
