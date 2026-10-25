@@ -154,6 +154,16 @@ DEFINE_bool(
     "runtime is missing or initialization fails, it deterministically falls "
     "back to the original render path.",
     "Display");
+DEFINE_bool(
+    dlss_optical_flow_enabled, false,
+    "NVIDIA Optical Flow (NVOF) sub-switch. Only effective when dlss_enabled "
+    "is true. When enabled together with the master switch, the D3D12 "
+    "presenter lazily creates the optical-flow backend on the first frame; "
+    "if the NVIDIA optical-flow runtime is missing or initialization fails, "
+    "it deterministically falls back to the original render path. The "
+    "estimated flow feeds the DLSS SR backend as its external motion-vector "
+    "input; it is not a native guest motion vector.",
+    "Display");
 DEFINE_string(
     dlss_sr_perf_quality, "balanced",
     "DLSS Super Resolution quality preset. Only effective when dlss_sr_enabled "
@@ -641,6 +651,13 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
             new_enhancement_config.render_preset =
                 kDlssSrRenderPresetOptions[new_dlss_render_preset_index];
         }
+        // The optical-flow (NVOF) sub-switch is only drawn (and only
+        // changeable) while the DLSS radio is selected (master on), same
+        // semantics as the SR sub-switch. The estimated flow is handed to
+        // the SR backend as its external motion-vector input.
+        bool new_optical_flow = new_enhancement_config.optical_flow_enabled;
+        ImGui::Checkbox("Optical Flow", &new_optical_flow);
+        new_enhancement_config.optical_flow_enabled = new_optical_flow;
       }
 #endif
 
@@ -793,6 +810,14 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
               new_enhancement_config.super_sampling_enabled) {
         OVERRIDE_bool(dlss_sr_enabled,
                       new_enhancement_config.super_sampling_enabled);
+      }
+      // Only persist the optical-flow sub-switch when the master is on (same
+      // semantics as the SR sub-switch).
+      if (new_enhancement_config.master_enabled &&
+          cvars_enhancement_config.optical_flow_enabled !=
+              new_enhancement_config.optical_flow_enabled) {
+        OVERRIDE_bool(dlss_optical_flow_enabled,
+                      new_enhancement_config.optical_flow_enabled);
       }
       // Only persist the SR quality preset while the SR sub-switch is on (the
       // slider is only drawn and changeable in that case).
@@ -1359,12 +1384,13 @@ EmulatorWindow::GetGuestOutputEnhancementConfigForCvars() {
   ui::GuestOutputEnhancementConfig enhancement_config;
   enhancement_config.master_enabled = cvars::dlss_enabled;
   enhancement_config.super_sampling_enabled = cvars::dlss_sr_enabled;
+  enhancement_config.optical_flow_enabled = cvars::dlss_optical_flow_enabled;
   enhancement_config.perf_quality =
       GetDlssSrPerfQualityForCvarValue(cvars::dlss_sr_perf_quality);
     enhancement_config.render_preset =
         GetDlssSrRenderPresetForCvarValue(cvars::dlss_sr_render_preset);
-  // NVOF / Frame Generation / experimental neural rendering sub-switches are
-  // not exposed in the UI yet (Phase 2+); keep them at their default-off.
+  // Frame Generation / experimental neural rendering sub-switches are not
+  // exposed in the UI yet (Phase 2+); keep them at their default-off.
   return enhancement_config;
 }
 

@@ -118,7 +118,9 @@ class DLSSSuperSamplingBackend final : public IDLSSSuperSamplingBackend {
       const Presenter::GuestOutputProperties& guest_output_properties,
       const DlssSrFrameParams& frame_params,
         ui::DlssSrPerfQuality perf_quality,
-        ui::DlssSrRenderPreset render_preset) override;
+        ui::DlssSrRenderPreset render_preset,
+        ID3D12Resource* external_motion_vectors,
+        ID3D12Resource* external_depth) override;
 
   // Getters for the backend output. The presenter uses these to create the SRV
   // (in its view heap) and to know the output size. The output texture is owned

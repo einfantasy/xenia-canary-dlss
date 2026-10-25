@@ -21,6 +21,10 @@ if(WIN32)
   # DLSS SR backend (Milestone 3-B). Windows-only (D3D12). Depends only on
   # xenia-base; the SDK headers are referenced by path, not copied.
   add_subdirectory(dlss)
+  # NVOF (NVIDIA Optical Flow) backend (Milestone 4-D). Windows-only (D3D12).
+  # Depends only on xenia-base; the SDK headers are referenced by path, not
+  # copied. Independent module - orthogonal to the DLSS SR backend.
+  add_subdirectory(nvof)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

@@ -20,6 +20,7 @@
 #include "xenia/base/math.h"
 #include "xenia/ui/d3d12/d3d12_provider.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
+#include "xenia/ui/nvof/nvof_optical_flow_backend.h"
 #include "xenia/ui/surface_win.h"
 
 DEFINE_bool(
@@ -62,6 +63,12 @@ D3D12Presenter::~D3D12Presenter() {
   // Shut down the DLSS SR backend after all GPU work has completed (the SDK
   // session is released on the CPU; the backend's output texture is released
   // by its destructor).
+  // Shut down NVOF first (its registered textures must be released before
+  // nvOFDestroy + FreeLibrary; Veyra-verified teardown order), then SR.
+  if (nvof_backend_) {
+    nvof_backend_->Shutdown();
+    nvof_backend_.reset();
+  }
   dlss_sr_backend_.reset();
 }
 
@@ -814,15 +821,53 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
               guest_output_enhancement_config_mutex_);
           enhancement_config = guest_output_enhancement_config_;
         }
-        if (enhancement_config.IsSuperSamplingRequested()) {
-          const uint32_t guest_width =
-              guest_output_properties.frontbuffer_width;
-          const uint32_t guest_height =
-              guest_output_properties.frontbuffer_height;
-          const bool is_one_to_one =
-              guest_width == paint_context_.swap_chain_width &&
-              guest_height == paint_context_.swap_chain_height;
-          if (!is_one_to_one) {
+        const uint32_t guest_width =
+            guest_output_properties.frontbuffer_width;
+        const uint32_t guest_height =
+            guest_output_properties.frontbuffer_height;
+        const bool is_one_to_one =
+            guest_width == paint_context_.swap_chain_width &&
+            guest_height == paint_context_.swap_chain_height;
+        const bool sr_requested =
+            enhancement_config.IsSuperSamplingRequested() && !is_one_to_one;
+        const bool of_requested =
+            enhancement_config.IsOpticalFlowRequested() && !is_one_to_one;
+
+        ID3D12Resource* mv_for_sr = nullptr;
+
+        // --- NVOF block (of_requested only; default off). ---
+        // The NVOF backend produces a full-resolution motion vector (MV)
+        // (R16G16_FLOAT, current -> previous) that the SR backend borrows as
+        // pInMotionVectors (mv_for_sr). NVOF and SR are orthogonal: an NVOF
+        // failure (or the first frame) leaves mv_for_sr null, so SR uses its
+        // internal zero placeholder MV. Lazily create the backend (only when
+        // OF is requested and not 1:1 bypassed). When the master switch is off
+        // this is never reached, so no backend is created, no DLL is loaded,
+        // and no GPU work is done.
+        if (of_requested) {
+          if (!nvof_backend_) {
+            nvof_backend_ =
+                std::make_unique<xe::ui::nvof::NVOFOpticalFlowBackend>(
+                    device, guest_width, guest_height, /*grid_size=*/4,
+                    /*quality=*/1);
+          }
+          BackendResult of_result = nvof_backend_->TryProcess(
+              command_list, provider_.GetDirectQueue(),
+              guest_output_resource.Get(), nvof_frame_counter_);
+          if (of_result == BackendResult::kSuccess &&
+              nvof_backend_->HasValidFlow()) {
+            mv_for_sr = nvof_backend_->MotionVectorOutput();
+          } else {
+            // Deterministic fallback: an NVOF failure (or the first frame,
+            // which has an invalid flow) leaves mv_for_sr null so SR uses its
+            // zero placeholder MV. Never marked as success.
+            mv_for_sr = nullptr;
+          }
+          ++nvof_frame_counter_;
+        }
+
+        // --- SR block (sr_requested only; existing). ---
+        if (sr_requested) {
             // Lazily create the backend (only when SR is actually requested and
             // not bypassed). When the master switch is off this is never
             // reached, so no backend is created, no DLL is loaded, and no GPU
@@ -846,7 +891,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
                 enhancement_config, dlss_sr_backend_.get(), command_list,
                 guest_output_resource.Get(), paint_context_.swap_chain_width,
                 paint_context_.swap_chain_height, guest_output_properties,
-                frame_params, &fallback_flow);
+                frame_params, &fallback_flow, mv_for_sr,
+                /*external_depth=*/nullptr);
             if (backend_result == BackendResult::kSuccess) {
               dlss_sr_used = true;
               if (backend_just_created) {
@@ -888,7 +934,6 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
               command_allocator->Reset();
               command_list->Reset(command_allocator, nullptr);
             }
-          }
         }
       }
 

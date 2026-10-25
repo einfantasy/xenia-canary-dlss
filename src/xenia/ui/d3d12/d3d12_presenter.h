@@ -372,6 +372,17 @@ class D3D12Presenter final : public Presenter {
   // never touches guest_output_resource_paint_refs.
   std::unique_ptr<IDLSSSuperSamplingBackend> dlss_sr_backend_;
 
+  // NVOF optical-flow backend (Milestone 4-E). Produces a full-resolution
+  // motion vector (R16G16_FLOAT, current -> previous) that the SR backend
+  // borrows as pInMotionVectors. Orthogonal to SR: NVOF failure does not force
+  // SR failure (SR falls back to its zero placeholder MV). nullptr when NVOF
+  // has never been requested. The backend never touches
+  // guest_output_resource_paint_refs.
+  std::unique_ptr<IOpticalFlowBackend> nvof_backend_;
+  // Monotonically increasing NVOF frame index (distinguishes the first frame
+  // from round-robin frame-pool slots). Incremented on every processed frame.
+  uint64_t nvof_frame_counter_ = 0;
+
   // DLSS SR enhancement config. Writable only by the UI thread, read by the
   // paint thread (under guest_output_enhancement_config_mutex_). All switches
   // default OFF.
