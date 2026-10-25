@@ -16,6 +16,7 @@
 #include "xenia/app/profile_dialogs.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/ui/guest_output_enhancement.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/immediate_drawer.h"
@@ -259,6 +260,22 @@ class EmulatorWindow {
   GetGuestOutputPaintEffectForCvarValue(const std::string& cvar_value);
   static ui::Presenter::GuestOutputPaintConfig
   GetGuestOutputPaintConfigForCvars();
+  static ui::GuestOutputEnhancementConfig
+  GetGuestOutputEnhancementConfigForCvars();
+  // For comparisons, use GetDlssSrPerfQualityForCvarValue instead as the
+  // default fallback may be used for multiple values (any unknown value maps
+  // to kBalanced).
+  static const char* GetCvarValueForDlssSrPerfQuality(
+      ui::DlssSrPerfQuality perf_quality);
+  static ui::DlssSrPerfQuality GetDlssSrPerfQualityForCvarValue(
+      const std::string& cvar_value);
+    // For comparisons, use GetDlssSrRenderPresetForCvarValue instead as the
+    // default fallback may be used for multiple values (any unknown value maps
+    // to kDefault).
+    static const char* GetCvarValueForDlssSrRenderPreset(
+        ui::DlssSrRenderPreset render_preset);
+    static ui::DlssSrRenderPreset GetDlssSrRenderPresetForCvarValue(
+        const std::string& cvar_value);
   void ApplyDisplayConfigForCvars();
 
   void OnKeyDown(ui::KeyEvent& e);

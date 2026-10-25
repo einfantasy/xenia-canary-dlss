@@ -14,10 +14,14 @@
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <mutex>
+#include <vector>
 
 #include "xenia/base/math.h"
+#include "xenia/ui/dlss/dlss_super_sampling_backend.h"
 #include "xenia/ui/d3d12/d3d12_gpu_completion_timeline.h"
 #include "xenia/ui/d3d12/d3d12_provider.h"
+#include "xenia/ui/guest_output_enhancement.h"
 #include "xenia/ui/presenter.h"
 #include "xenia/ui/surface.h"
 
@@ -97,6 +101,14 @@ class D3D12Presenter final : public Presenter {
   ~D3D12Presenter();
 
   const D3D12Provider& provider() const { return provider_; }
+
+  // UI thread only. Mirrors the GuestOutputPaintConfig access pattern: the UI
+  // thread writes the enhancement config, the paint thread reads it (under the
+  // mutex) while painting.
+  void SetGuestOutputEnhancementConfigFromUIThread(
+      const GuestOutputEnhancementConfig& new_config);
+  const GuestOutputEnhancementConfig& GetGuestOutputEnhancementConfigFromUIThread()
+      const;
 
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
@@ -212,8 +224,13 @@ class D3D12Presenter final : public Presenter {
       kViewIndexGuestOutputIntermediate0Srv =
           kViewIndexGuestOutput0Srv + kGuestOutputMailboxSize,
 
-      kViewCount = kViewIndexGuestOutputIntermediate0Srv +
-                   kMaxGuestOutputPaintEffects - 1,
+      // SRV of the DLSS SR backend's output texture. Only written when the
+      // backend is active and produced usable output; the first paint effect's
+      // source is redirected to it.
+      kViewIndexDLSSSrOutputSrv =
+          kViewIndexGuestOutputIntermediate0Srv + kMaxGuestOutputPaintEffects - 1,
+
+      kViewCount = kViewIndexDLSSSrOutputSrv + 1,
     };
 
     void AwaitSwapChainUsageCompletion() {
@@ -292,6 +309,18 @@ class D3D12Presenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
+  // Resolves the runtime directories to search for the NGX runtime DLLs,
+  // relative to the executable (per the design: the runtime is deployed
+  // alongside the main program and referenced by relative path). Returns an
+  // empty vector when the executable path cannot be determined.
+  std::vector<std::wstring> GetDLSSRuntimeDirectories() const;
+
+  // Resolves the absolute path to the ngx-local.json config file, relative to
+  // the executable (runtime\config\ngx-local.json). Returns an empty string when
+  // the executable path cannot be determined (the backend then fails to load the
+  // config and falls back to the original path).
+  std::wstring GetDLSSConfigPath() const;
+
   const D3D12Provider& provider_;
 
   // Whether DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING is supported by DXGI (depends in
@@ -335,6 +364,19 @@ class D3D12Presenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+
+  // DLSS SR backend (Milestone 3-B). Lazily created when SR is requested and
+  // the guest output is not already at the target resolution (1:1 bypass).
+  // Owns its output texture and the SDK feature handle; only borrows the guest
+  // output (read-only). nullptr when SR has never been requested. The backend
+  // never touches guest_output_resource_paint_refs.
+  std::unique_ptr<IDLSSSuperSamplingBackend> dlss_sr_backend_;
+
+  // DLSS SR enhancement config. Writable only by the UI thread, read by the
+  // paint thread (under guest_output_enhancement_config_mutex_). All switches
+  // default OFF.
+  GuestOutputEnhancementConfig guest_output_enhancement_config_;
+  std::mutex guest_output_enhancement_config_mutex_;
 };
 
 }  // namespace d3d12

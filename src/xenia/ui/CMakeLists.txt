@@ -17,6 +17,12 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 xe_target_defaults(xenia-ui)
 
+if(WIN32)
+  # DLSS SR backend (Milestone 3-B). Windows-only (D3D12). Depends only on
+  # xenia-base; the SDK headers are referenced by path, not copied.
+  add_subdirectory(dlss)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Japanese glyphs for ImGui. fontconfig's CJK match is often a CFF or
   # variable font that stb_truetype cannot load (see LoadJapaneseFont).

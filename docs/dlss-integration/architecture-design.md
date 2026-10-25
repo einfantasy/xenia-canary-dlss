@@ -2,8 +2,8 @@
 
 > 状态：架构设计稿（DESIGN），**用户已正式批准**（2026-10-20，决策 1–7，见 §L3）。
 > 本阶段**仅做只读分析、证据核查、架构设计、文档编写**。未实现任何代码、未构建、未加载 DLL、未执行 GPU 操作、未创建 Mock。
-> **当前进度**：Milestone 1 架构已批准；**Milestone 2 已完成并正式验收**（最小后端接口骨架、默认关闭配置、独立结果契约、原始路径回退构造器、路径选择函数与主机侧测试 15 用例 / 45 断言全部交付，独立交付审查结论 `PASS WITH FINDINGS`）。详见 `docs/dlss-integration/milestone-2-audit.md`。
-> 证据标签约定：`STATIC_VERIFIED`（当前源码已核实）｜`SDK-DOC-SUPPORTED`（SDK 文档/头文件支持）｜`DESIGN PROPOSAL`（本设计建议）｜`UNVERIFIED`（未验证）｜`RUNTIME_VERIFIED_ON_RTX4090`（仅在真实 RTX 4090 证据存在时使用——本阶段**无任何**项可用）。
+> **当前进度**：Milestone 1 架构已批准；**Milestone 2 已完成并正式验收**（最小后端接口骨架、默认关闭配置、独立结果契约、原始路径回退构造器、路径选择函数与主机侧测试，独立交付审查结论 `PASS WITH FINDINGS`）；**Milestone 3-A / 3-B / 3-C 已完成**（DLSS SR 真实后端与 Presenter 接线、UI 开关 Phase 1 主开关 + SR 子复选框与 Phase 2 质量滑块、RTX 4090 实机运行时验证 `RUNTIME_VERIFIED_ON_RTX4090`）；**Milestone 3.1（DLSS SR render preset 切换）已完成**（调查 + 设计 + 实施，release 构建通过、主机侧测试全绿 18 用例 / 53 断言，真实后端逻辑 `UNVERIFIED`）。详见 `docs/dlss-integration/` 下对应里程碑文档。
+> 证据标签约定：`STATIC_VERIFIED`（当前源码已核实）｜`SDK-DOC-SUPPORTED`（SDK 文档/头文件支持）｜`DESIGN PROPOSAL`（本设计建议）｜`UNVERIFIED`（未验证）｜`RUNTIME_VERIFIED_ON_RTX4090`（仅在真实 RTX 4090 证据存在时使用——Milestone 3-C 已产出首批此类证据）。
 
 ---
 
@@ -543,10 +543,35 @@ flowchart TB
 - 停止点：完成本步后停止（**不**自动进入 Milestone 3）。
 
 ### K3. Milestone 3：DLSS SR 后端接入（接口骨架与资源契约稳定后）
-- 独立处理：SDK 版本兼容、DLL 加载策略、D3D12 资源状态与同步、失败回退、RTX 4090 实机验证。
-- 修改范围：`D3D12Presenter` 后端接入 + 路径选择组件。
-- 验收条件：RTX 4090 实机 `Evaluate` 成功、输出有效、回退正确。
-- 停止点：SR 版本稳定后停止。
+#### K3.1. Milestone 3-A：接入前技术审查与实施设计
+- 核验实际使用的 DLSS SDK 头文件、API、版本兼容性、运行时依赖和许可证条件。
+- 明确输入/输出资源契约、格式、尺寸、资源状态、生命周期、队列同步及 Fence 依赖。
+- 审查 PaintAndPresentImpl、GetGuestOutputPaintFlow 和现有呈现流程，确定后端接线与原始路径回退方案。
+- 输出具体修改文件清单、实施步骤、验证计划和剩余风险。
+- 本阶段仅审查与设计，不修改代码、不加载 DLL、不执行 GPU 操作。
+- 完成后停止，等待用户审核与 M3-B 授权。
+- **已完成**：输出接入前审查与实施设计（`milestone-3-a-audit.md`），用户审核通过。
+
+#### K3.2. Milestone 3-B：DLSS SR 后端实现与 Presenter 接线
+实现实际 SDK 后端、必要的运行时加载与初始化逻辑，并将路径选择接入 D3D12Presenter。
+按已批准的资源契约处理输入/输出资源、状态转换、同步和生命周期。
+实现初始化失败、后端不可用、执行失败、输出无效和设备丢失等情况下的确定性回退。
+完成当前环境可执行的编译、静态检查和主机侧测试。
+不得因编译或 Mock 测试通过而宣称真实 DLSS 已可用。
+完成后停止，提交 A–G 验收报告，等待用户审核与 M3-C 授权。
+- **已完成**：真实 `DLSSSuperSamplingBackend` 与 Presenter 接线（惰性创建、确定性回退、深度/MV 零值诚实回退、上传缓冲成员化修复 GPU 设备移除）。UI 开关 Phase 1（`dlss_enabled` 主开关 + `dlss_sr_enabled` SR 子复选框）与 Phase 2（`dlss_sr_perf_quality` 质量滑块 0..3，后端越界契约校验 + 变更重建）已实施并编译通过。详见 `milestone-3-b-*` 系列文档与 `milestone-3-b-ui-dlss-switch-design.md`。
+
+#### K3.3. Milestone 3-C：RTX 4090 实机验证与 SR 稳定性验收（需要人工参与）
+在具备受支持 NVIDIA GPU、驱动、SDK 和运行时的环境中验证真实 SDK 初始化与 Evaluate。
+验证输出有效性、画面正确性、资源同步、失败回退和设备丢失行为。
+评估 SR 画质、性能、稳定性及不同配置下的行为。
+只有实际测试成功的项目才可标记为已验证；未执行或未通过的项目必须保留未验证状态。
+- **已完成**：RTX 4090 实机验证 SDK 初始化、CreateFeature、Evaluate、质量档变更重建（`RUNTIME_VERIFIED_ON_RTX4090`）。画质与性能尚未评估。详见 `milestone-3-c-handoff.md`。
+
+#### K3.4. Milestone 3.1：DLSS SR render preset 切换
+- 调查 `NVSDK_NGX_DLSS_Hint_Render_Preset` 的官方用法（§3.12 + 附录 §9.1），确认切换仅能走 create-time 重建（`ReleaseFeature` + `CreateFeature`），无原地更新 API；OTA 非切换机制。
+- 设计并实施 render preset 切换：Xenia 侧 `DlssSrRenderPreset` 枚举（0/10/11/12/13，与 SDK 头文件显式值一致，UI 层零 `nvsdk_*` 依赖），默认 `kDefault` 完全不 `SetUI`（零行为变化），切换走既有质量档重建通路，越界 = `kInputContractFailed`。UI 新增 `dlss_sr_render_preset` cvar 与选择控件。
+- **已完成**：release 构建通过、主机侧测试全绿（18 用例 / 53 断言）。真实后端逻辑（SetUI 下发、重建、越界契约失败）`UNVERIFIED`（无 GPU）。详见 `milestone-3-1-dlss-sr-render-preset-investigation.md` 与 `milestone-3-1-dlss-sr-render-preset-switch-design.md`。
 
 ### K4. 后续独立阶段
 #### K4.1. Milestone 4：NVOF 独立集成与可行性验证

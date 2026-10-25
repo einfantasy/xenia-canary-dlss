@@ -59,6 +59,10 @@ D3D12Presenter::~D3D12Presenter() {
   if (ui_completion_timeline_) {
     ui_completion_timeline_->AwaitAllSubmissions();
   }
+  // Shut down the DLSS SR backend after all GPU work has completed (the SDK
+  // session is released on the CPU; the backend's output texture is released
+  // by its destructor).
+  dlss_sr_backend_.reset();
 }
 
 Surface::TypeFlags D3D12Presenter::GetSupportedSurfaceTypes() const {
@@ -67,6 +71,82 @@ Surface::TypeFlags D3D12Presenter::GetSupportedSurfaceTypes() const {
   types |= Surface::kTypeFlag_Win32Hwnd;
 #endif
   return types;
+}
+
+void D3D12Presenter::SetGuestOutputEnhancementConfigFromUIThread(
+    const GuestOutputEnhancementConfig& new_config) {
+  std::lock_guard<std::mutex> lock(guest_output_enhancement_config_mutex_);
+  guest_output_enhancement_config_ = new_config;
+}
+
+const GuestOutputEnhancementConfig&
+D3D12Presenter::GetGuestOutputEnhancementConfigFromUIThread() const {
+  return guest_output_enhancement_config_;
+}
+
+// Maps a BackendResult to a stable string for logging (failure classification
+// per the architecture design, section 5).
+static const char* BackendResultToString(BackendResult result) {
+  switch (result) {
+    case BackendResult::kNotRequested:
+      return "kNotRequested";
+    case BackendResult::kSuccess:
+      return "kSuccess";
+    case BackendResult::kUnavailable:
+      return "kUnavailable";
+    case BackendResult::kInitFailed:
+      return "kInitFailed";
+    case BackendResult::kInputContractFailed:
+      return "kInputContractFailed";
+    case BackendResult::kSyncConditionFailed:
+      return "kSyncConditionFailed";
+    case BackendResult::kExecutionFailed:
+      return "kExecutionFailed";
+    case BackendResult::kOutputInvalid:
+      return "kOutputInvalid";
+    case BackendResult::kOriginalPathFallback:
+      return "kOriginalPathFallback";
+  }
+  return "unknown";
+}
+
+std::vector<std::wstring> D3D12Presenter::GetDLSSRuntimeDirectories() const {
+  wchar_t exe_path[MAX_PATH];
+  if (!GetModuleFileNameW(nullptr, exe_path, MAX_PATH)) {
+    XELOGW("DLSS SR: could not determine the executable path; the DLSS "
+           "runtime directories are unavailable (the backend will report the "
+           "runtime as missing).");
+    return {};
+  }
+  std::wstring exe_dir(exe_path);
+  const size_t slash = exe_dir.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) {
+    return {};
+  }
+  exe_dir = exe_dir.substr(0, slash + 1);  // keep the trailing separator.
+  const std::wstring runtime_root = exe_dir + L"runtime";
+  // The NGX runtime DLLs (the SR feature nvngx_dlss.dll and the runtime core
+  // nvngxruntime.dll) are staged in the experimental subdirectory of the
+  // runtime root (see the runtime deployment layout). The SDK does not search
+  // recursively, so the directory is listed explicitly.
+  return {runtime_root + L"\\experimental"};
+}
+
+std::wstring D3D12Presenter::GetDLSSConfigPath() const {
+  wchar_t exe_path[MAX_PATH];
+  if (!GetModuleFileNameW(nullptr, exe_path, MAX_PATH)) {
+    XELOGW("DLSS SR: could not determine the executable path; the DLSS config "
+           "path is unavailable (the backend will fail to load the config and "
+           "fall back to the original path).");
+    return {};
+  }
+  std::wstring exe_dir(exe_path);
+  const size_t slash = exe_dir.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) {
+    return {};
+  }
+  exe_dir = exe_dir.substr(0, slash + 1);  // keep the trailing separator.
+  return exe_dir + L"runtime\\config\\ngx-local.json";
 }
 
 bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
@@ -543,6 +623,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
       D3D12_CPU_DESCRIPTOR_HANDLE view_heap_cpu_start =
           view_heap->GetCPUDescriptorHandleForHeapStart();
 
+      // True when the DLSS SR backend produced usable output this frame; the
+      // first paint effect's source is redirected to the backend output SRV.
+      // False otherwise (original path reads the guest output directly).
+      bool dlss_sr_used = false;
+
       // Store the main target reference to the guest output texture so it's not
       // destroyed while it's still potentially in use by main target painting
       // queued on the GPU.
@@ -715,6 +800,98 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
         }
       }
 
+      // Try the DLSS SR backend (Milestone 3-B). Reached only when the guest
+      // output has a paint flow, SR is requested (master && SR sub-switch), and
+      // the guest output is not already at the target resolution (1:1 bypass).
+      // The backend records its GPU commands (barriers + EvaluateFeature) into
+      // the command list. On success the first paint effect reads the backend
+      // output; on failure the command list is reset and the original path is
+      // re-recorded by the effect loop below.
+      {
+        GuestOutputEnhancementConfig enhancement_config;
+        {
+          std::lock_guard<std::mutex> lock(
+              guest_output_enhancement_config_mutex_);
+          enhancement_config = guest_output_enhancement_config_;
+        }
+        if (enhancement_config.IsSuperSamplingRequested()) {
+          const uint32_t guest_width =
+              guest_output_properties.frontbuffer_width;
+          const uint32_t guest_height =
+              guest_output_properties.frontbuffer_height;
+          const bool is_one_to_one =
+              guest_width == paint_context_.swap_chain_width &&
+              guest_height == paint_context_.swap_chain_height;
+          if (!is_one_to_one) {
+            // Lazily create the backend (only when SR is actually requested and
+            // not bypassed). When the master switch is off this is never
+            // reached, so no backend is created, no DLL is loaded, and no GPU
+            // work is done.
+              // The quality preset AND the render preset are create-time
+              // parameters passed to the backend on every frame (via the
+              // enhancement config, read under the mutex above); the backend
+              // detects a change and re-creates the feature internally
+              // (release + re-create), exactly like a size change. So no full
+              // backend rebuild is needed here.
+            const bool backend_just_created = (!dlss_sr_backend_);
+            if (!dlss_sr_backend_) {
+              dlss_sr_backend_ =
+                  std::make_unique<xe::ui::dlss::DLSSSuperSamplingBackend>(
+                  device, GetDLSSRuntimeDirectories(), GetDLSSConfigPath(),
+                  enhancement_config.perf_quality);
+            }
+            DlssSrFrameParams frame_params{};  // jitter 0, no reset (M3-B).
+            Presenter::GuestOutputPaintFlow fallback_flow;
+            BackendResult backend_result = SelectOutputPath(
+                enhancement_config, dlss_sr_backend_.get(), command_list,
+                guest_output_resource.Get(), paint_context_.swap_chain_width,
+                paint_context_.swap_chain_height, guest_output_properties,
+                frame_params, &fallback_flow);
+            if (backend_result == BackendResult::kSuccess) {
+              dlss_sr_used = true;
+              if (backend_just_created) {
+              XELOGI("DLSS SR: backend activated; the paint path now reads "
+                     "the DLSS output (input={}x{} -> output={}x{}).",
+                       guest_width, guest_height,
+                       paint_context_.swap_chain_width,
+                       paint_context_.swap_chain_height);
+              }
+              // Create the SRV of the backend output in the view heap (CPU).
+              // The backend owns the output texture; we only create a view of
+              // it for the first paint effect to read.
+              ID3D12Resource* backend_output =
+                  dlss_sr_backend_->OutputResource();
+              D3D12_SHADER_RESOURCE_VIEW_DESC backend_output_srv_desc;
+              backend_output_srv_desc.Format = kGuestOutputFormat;
+              backend_output_srv_desc.ViewDimension =
+                  D3D12_SRV_DIMENSION_TEXTURE2D;
+              backend_output_srv_desc.Shader4ComponentMapping =
+                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+              backend_output_srv_desc.Texture2D.MostDetailedMip = 0;
+              backend_output_srv_desc.Texture2D.MipLevels = 1;
+              backend_output_srv_desc.Texture2D.PlaneSlice = 0;
+              backend_output_srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+              device->CreateShaderResourceView(
+                  backend_output, &backend_output_srv_desc,
+                  provider_.OffsetViewDescriptor(
+                      view_heap_cpu_start,
+                      PaintContext::kViewIndexDLSSSrOutputSrv));
+            } else {
+              // Backend failure: the command list may contain recorded (but not
+              // executed) backend commands. Reset it to discard them, then the
+              // original path is re-recorded by the effect loop below. The guest
+              // output is still in PIXEL_SHADER_RESOURCE (nothing was executed),
+              // so the original path is safe.
+              XELOGW("DLSS SR: SelectOutputPath returned {}; falling back to "
+                     "the original paint path this frame.",
+                     BackendResultToString(backend_result));
+              command_allocator->Reset();
+              command_list->Reset(command_allocator, nullptr);
+            }
+          }
+        }
+      }
+
       if (guest_output_flow.effect_count) {
         paint_context_
             .guest_output_resource_paint_refs
@@ -831,8 +1008,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
 
         UINT effect_src_view_index = UINT(
             i ? (PaintContext::kViewIndexGuestOutputIntermediate0Srv + (i - 1))
-              : (PaintContext::kViewIndexGuestOutput0Srv +
-                 guest_output_resource_paint_ref_index));
+              : (dlss_sr_used
+                     ? PaintContext::kViewIndexDLSSSrOutputSrv
+                     : (PaintContext::kViewIndexGuestOutput0Srv +
+                        guest_output_resource_paint_ref_index)));
         command_list->SetGraphicsRootDescriptorTable(
             UINT(GuestOutputPaintRootParameter::kSource),
             provider_.OffsetViewDescriptor(view_heap_gpu_start,

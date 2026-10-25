@@ -1,7 +1,10 @@
 add_library(xenia-ui-d3d12 STATIC)
 xe_platform_sources(xenia-ui-d3d12 ${CMAKE_CURRENT_SOURCE_DIR})
 xe_shader_rules_dxbc(xenia-ui-d3d12 ${CMAKE_CURRENT_SOURCE_DIR}/../shaders)
-target_link_libraries(xenia-ui-d3d12 PUBLIC xenia-base xenia-ui)
+# xenia-dlss is the DLSS SR backend (Milestone 3-B). The presenter includes the
+# backend header and lazily creates the backend. The backend module is the only
+# place that depends on the NVIDIA SDK (license isolation).
+target_link_libraries(xenia-ui-d3d12 PUBLIC xenia-base xenia-ui xenia-dlss)
 xe_target_defaults(xenia-ui-d3d12)
 
 if(XENIA_BUILD_MISC)
