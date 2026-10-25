@@ -30,6 +30,8 @@
 // forward-declared pointers avoids pulling the full d3d12.h into this header.
 struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
+struct ID3D12CommandQueue;
+struct ID3D12Fence;
 
 namespace xe {
 namespace ui {
@@ -272,7 +274,18 @@ class IDLSSSuperSamplingBackend {
       // triggers a backend re-create (release + re-create). kDefault (=0)
       // means "do not send the hint" (the SDK resolves the mode's default
       // preset).
-      DlssSrRenderPreset render_preset) = 0;
+      DlssSrRenderPreset render_preset,
+      // Optional borrowed external motion vectors (R16G16_FLOAT, NPSR/UAV,
+      // pixel units, current -> previous), produced by the NVOF backend.
+      // nullptr = use the internal zero-filled placeholder (behavior identical
+      // to before this parameter existed). When non-null and valid, the
+      // backend binds it as pInMotionVectors instead of the zero placeholder.
+      // The backend borrows it read-only; it never takes ownership.
+      ID3D12Resource* external_motion_vectors,
+      // Optional borrowed external depth (R32_FLOAT, NPSR/UAV). nullptr = use
+      // the internal synthetic zero depth (behavior identical to before). The
+      // backend borrows it read-only; it never takes ownership.
+      ID3D12Resource* external_depth) = 0;
 
   // The backend's owned output texture, valid after a successful TryProcess
   // (the backend created it during initialization). The presenter uses these
@@ -284,6 +297,81 @@ class IDLSSSuperSamplingBackend {
   virtual uint32_t OutputHeight() const { return 0; }
 
   // Release backend-owned resources. The presenter never destroys backend
+  // resources directly; this is the backend's responsibility.
+  virtual void Shutdown() = 0;
+};
+
+// ---------------------------------------------------------------------------
+// IOpticalFlowBackend
+//
+// The minimal NVIDIA Optical Flow (NVOF) backend interface. This is an
+// independent module, orthogonal to the DLSS SR backend: producing optical
+// flow does not imply DLSS SR capability, and vice versa (the independence
+// principle in AGENTS.md). A real implementation (Milestone 4-D) owns its own
+// ABGR8 frame pool, raw grid flow/cost textures, full-resolution MV and
+// confidence outputs, its input/output fences, a private view heap + root
+// signature, and the NVOF SDK session. It only borrows the input frame
+// (read-only, R10G10B10A2) and never takes over
+// guest_output_resource_paint_refs.
+//
+// In Milestone 4-D this interface is implemented by a standalone module
+// (nvof/*) that is driven by test components with controlled inputs; it is NOT
+// wired into the presenter's paint path. Presenter wiring is deferred to a
+// later milestone (it requires separate approval per the 4-D scope).
+// ---------------------------------------------------------------------------
+class IOpticalFlowBackend {
+ public:
+  virtual ~IOpticalFlowBackend() = default;
+
+  // Whether the backend is currently available (runtime present and capable).
+  virtual bool IsAvailable() const = 0;
+  // True when the first creation failed and the backend will not retry the SDK.
+  virtual bool IsUnavailable() const = 0;
+
+  // Attempt to process one frame. Records the ABGR8 conversion pass, the NVOF
+  // execute (input = ABGR8 current frame, reference = ABGR8 previous frame),
+  // and the densify pass into the caller's command list. Returns a BackendResult:
+  // kSuccess, or one of the specific failure reasons. On the first frame
+  // (frame_index == 0) the flow is invalid (no valid reference); HasValidFlow()
+  // is false and the caller must use zero MV. The command list is a recording
+  // buffer; on failure the caller resets it (the backend does not reset it
+  // itself).
+  virtual BackendResult TryProcess(
+      ID3D12GraphicsCommandList* command_list,
+      ID3D12CommandQueue* command_queue,
+      ID3D12Resource* input_frame,  // R10G10B10A2 (guest output), read-only.
+      uint32_t frame_index) = 0;
+
+  // The backend's owned full-resolution MV output texture (R16G16_FLOAT, pixel
+  // units, current -> previous). Valid after a successful TryProcess with a
+  // valid flow. The default implementation returns nullptr so host-test stub
+  // backends need no override; the real NVOF backend overrides it.
+  virtual ID3D12Resource* MotionVectorOutput() const { return nullptr; }
+  // The backend's owned full-resolution confidence output (R8_UNORM, [0, 1]).
+  virtual ID3D12Resource* ConfidenceOutput() const { return nullptr; }
+  // The backend's owned raw grid flow (R16G16_SINT, S10.5, grid extent) and
+  // cost (R8_UINT, grid extent). Exposed for validation (read-back).
+  virtual ID3D12Resource* GridFlowOutput() const { return nullptr; }
+  virtual ID3D12Resource* GridCostOutput() const { return nullptr; }
+  virtual uint32_t OutputWidth() const { return 0; }
+  virtual uint32_t OutputHeight() const { return 0; }
+  // The grid extent of the raw NVOF flow (ceil(width / grid) x ceil(height / grid)).
+  virtual uint32_t GridWidth() const { return 0; }
+  virtual uint32_t GridHeight() const { return 0; }
+
+  // True after a successful TryProcess with a valid flow (frame_index > 0 and no
+  // failure). False on the first frame or on any failure; the caller uses zero
+  // MV in that case.
+  virtual bool HasValidFlow() const { return false; }
+
+  // The backend's owned input fence. The caller signals it to frame_index after
+  // the input frame is GPU-ready (the NVOF session waits on it before running).
+  // The caller does NOT wait on the output fence: the NVOF session's output
+  // fence is an internal synchronization that the main command list observes;
+  // the caller waits on its own command-list completion fence instead.
+  virtual ID3D12Fence* GetInputFence() const { return nullptr; }
+
+  // Release backend-owned resources. The caller never destroys backend
   // resources directly; this is the backend's responsibility.
   virtual void Shutdown() = 0;
 };
@@ -328,7 +416,12 @@ BackendResult SelectOutputPath(const GuestOutputEnhancementConfig& config,
                                uint32_t output_height,
                                const Presenter::GuestOutputProperties& guest_output_properties,
                                const DlssSrFrameParams& frame_params,
-                               Presenter::GuestOutputPaintFlow* fallback_flow_out);
+                               Presenter::GuestOutputPaintFlow* fallback_flow_out,
+                               // Optional borrowed external MV / depth (from the
+                               // NVOF backend). nullptr = internal zero placeholder
+                               // (behavior identical to before this parameter).
+                               ID3D12Resource* external_motion_vectors = nullptr,
+                               ID3D12Resource* external_depth = nullptr);
 
 }  // namespace ui
 }  // namespace xe

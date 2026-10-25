@@ -879,7 +879,9 @@ BackendResult DLSSSuperSamplingBackend::TryProcess(
     const Presenter::GuestOutputProperties& guest_output_properties,
     const DlssSrFrameParams& frame_params,
       ui::DlssSrPerfQuality requested_quality,
-      ui::DlssSrRenderPreset requested_render_preset) {
+      ui::DlssSrRenderPreset requested_render_preset,
+      ID3D12Resource* external_motion_vectors,
+      ID3D12Resource* external_depth) {
   // 0. Cached unavailable: do not retry the SDK.
   if (state_ == State::kUnavailable) {
     return BackendResult::kUnavailable;
@@ -983,8 +985,19 @@ BackendResult DLSSSuperSamplingBackend::TryProcess(
   NVSDK_NGX_D3D12_DLSS_Eval_Params eval_params{};
   eval_params.Feature.pInColor = guest_output;
   eval_params.Feature.pInOutput = output_texture_.Get();
-  eval_params.pInDepth = depth_texture_.Get();
-  eval_params.pInMotionVectors = motion_vectors_texture_.Get();
+  // External MV / depth handoff (Milestone 4-E). When the caller provides a
+  // valid external motion-vector texture (from the NVOF backend) or an
+  // external depth texture, bind those instead of the internal zero-filled
+  // placeholders. Both are borrowed read-only (NPSR/UAV, the same state the
+  // SDK's compute shader expects). nullptr = use the internal placeholder
+  // (behavior identical to before this handoff existed). The SDK binds both
+  // as UAVs and reads them without writing, so the NVOF MV output (written
+  // in UAV state by the densify pass) is directly consumable.
+  eval_params.pInDepth =
+      external_depth ? external_depth : depth_texture_.Get();
+  eval_params.pInMotionVectors = external_motion_vectors
+      ? external_motion_vectors
+      : motion_vectors_texture_.Get();
   eval_params.InJitterOffsetX = frame_params.jitter_x;
   eval_params.InJitterOffsetY = frame_params.jitter_y;
   eval_params.InReset = frame_params.in_reset ? 1 : 0;

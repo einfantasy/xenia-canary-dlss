@@ -43,7 +43,9 @@ BackendResult SelectOutputPath(const GuestOutputEnhancementConfig& config,
                                uint32_t output_height,
                                const Presenter::GuestOutputProperties& guest_output_properties,
                                const DlssSrFrameParams& frame_params,
-                               Presenter::GuestOutputPaintFlow* fallback_flow_out) {
+                               Presenter::GuestOutputPaintFlow* fallback_flow_out,
+                               ID3D12Resource* external_motion_vectors,
+                               ID3D12Resource* external_depth) {
   // 1. Not requested: master off, SR sub-switch off, or backend not initialized.
   //    The backend is never called in this case (no DLL load, no GPU work).
   if (!config.IsSuperSamplingRequested() || backend == nullptr) {
@@ -57,7 +59,8 @@ BackendResult SelectOutputPath(const GuestOutputEnhancementConfig& config,
   BackendResult result =
       backend->TryProcess(command_list, guest_output_resource, output_width,
                           output_height, guest_output_properties, frame_params,
-                            config.perf_quality, config.render_preset);
+                            config.perf_quality, config.render_preset,
+                            external_motion_vectors, external_depth);
 
   // 3. Success: the backend produced usable output. Use the backend path.
   if (result == BackendResult::kSuccess) {

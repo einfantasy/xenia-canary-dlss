@@ -4,7 +4,11 @@ xe_shader_rules_dxbc(xenia-ui-d3d12 ${CMAKE_CURRENT_SOURCE_DIR}/../shaders)
 # xenia-dlss is the DLSS SR backend (Milestone 3-B). The presenter includes the
 # backend header and lazily creates the backend. The backend module is the only
 # place that depends on the NVIDIA SDK (license isolation).
-target_link_libraries(xenia-ui-d3d12 PUBLIC xenia-base xenia-ui xenia-dlss)
+# xenia-nvof is the NVOF optical-flow backend (Milestone 4-E). The presenter
+# includes the backend header and lazily creates the backend to produce the
+# motion vectors the SR backend borrows. It is an independent module (license
+# isolation, orthogonal to xenia-dlss).
+target_link_libraries(xenia-ui-d3d12 PUBLIC xenia-base xenia-ui xenia-dlss xenia-nvof)
 xe_target_defaults(xenia-ui-d3d12)
 
 if(XENIA_BUILD_MISC)
