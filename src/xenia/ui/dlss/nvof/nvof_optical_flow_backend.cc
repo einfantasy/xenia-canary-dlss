@@ -66,6 +66,23 @@ const D3D12_HEAP_PROPERTIES kUploadHeapProperties = {
 const uint32_t kNegate = 0;
 const uint32_t kCostThreshold = 32;
 
+// Stage-3 discard sentinel (experimental, hardware-unverified): for pixels
+// whose content changed (cost >= costThreshold), the densify pass writes
+// float2(sentinel, sentinel) to the MV instead of (0,0). DLSS SR has no
+// per-pixel invalid-MV value, so this probes how the SR SDK interprets an
+// extreme MV on a "changed" pixel. 0.0f preserves the current zero-MV
+// behavior and is the safe default; candidates for controlled hardware
+// testing are 65504.0, -65504.0 and NaN (the MV texture is R16G16_FLOAT
+// half). Verification must follow the Veyra E-1-style displacement probe.
+const float kDiscardSentinel = 0.0f;
+
+// Packs a float's IEEE-754 bits so it can travel through a uint cbuffer.
+uint32_t PackFloatBits(float v) {
+  uint32_t bits;
+  std::memcpy(&bits, &v, sizeof(bits));
+  return bits;
+}
+
 // ---------------------------------------------------------------------------
 // Embedded HLSL shaders (compiled at runtime via D3DCompile).
 //
@@ -81,7 +98,7 @@ const uint32_t kCostThreshold = 32;
 // is nearest-neighbor. Cost is a rejection signal: higher cost = less
 // reliable, so confidence = (255 - cost) / 255. Cells with cost >= threshold
 // are zeroed. The constants are bound via a root 32-bit-constants parameter
-// (NOT a CBV), so the cbuffer is declared at b0 with 7 uint32 members.
+// (NOT a CBV), so the cbuffer is declared at b0 with 9 uint32 members.
 // ---------------------------------------------------------------------------
 const char kAbgr8ConvertHlsl[] = R"(
 Texture2D<float4> inputTex : register(t0);
@@ -113,6 +130,7 @@ cbuffer DensifyConstants : register(b0)
     uint negate;
     uint costThreshold;
     uint validationFlags;   // bit0 bounds, bit1 photometric (Veyra convention)
+    uint discardSentinelBits;   // packed float: Stage-3 sentinel (see C++)
 }
 
 [numthreads(8, 8, 1)]
@@ -126,7 +144,14 @@ void main(uint3 globalId : SV_DispatchThreadID)
     if (negate != 0) v = -v;
     uint cost = rawCost[uint2(gx, gy)];
     float confidence = float(255u - min(cost, 255u)) / 255.0;
-    if (cost >= costThreshold) { v = float2(0, 0); confidence = 0.0; }
+    // Stage-3: "content changed" pixels get the sentinel MV (0.0f default =
+    // zero MV, current behavior). The out-of-bounds case below stays zeroed
+    // (different semantics: reference outside the frame, not content change).
+    float sentinel = asfloat(discardSentinelBits);
+    if (cost >= costThreshold) {
+      v = float2(sentinel, sentinel);
+      confidence = 0.0;
+    }
     else if (validationFlags != 0) {
         // Photometric/bounds validation (ported from Veyra's NvofDensify.hlsl):
         // reject out-of-frame reprojections and gate large luma disagreement.
@@ -925,7 +950,7 @@ BackendResult NVOFOpticalFlowBackend::Initialize(
   //       7: motion vector UAV      (densify u0)
   //       8: confidence UAV         (densify u1)
   //     Root signature: [0] SRV descriptor table (t0/t1/t2/t3), [1] UAV u0,
-  //     [2] UAV u1, [3] 32-bit constants (8, densify cbuffer b0).
+  //     [2] UAV u1, [3] 32-bit constants (9, densify cbuffer b0).
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   heap_desc.NumDescriptors = 9;
@@ -942,7 +967,7 @@ BackendResult NVOFOpticalFlowBackend::Initialize(
   //       t2 = ABGR8 previous, t3 = ABGR8 current, for validation),
   //   [1] UAV root descriptor (u0 = full-resolution MV),
   //   [2] UAV root descriptor (u1 = confidence),
-  //   [3] 32-bit constants (b0, the densify cbuffer: 8 values).
+  //   [3] 32-bit constants (b0, the densify cbuffer: 9 values).
   //
   // NOTE: this Windows SDK's D3D12_ROOT_PARAMETER is the classic layout -
   // a struct with ParameterType, an anonymous union (.DescriptorTable /
@@ -973,7 +998,7 @@ BackendResult NVOFOpticalFlowBackend::Initialize(
   root_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   root_params[3].Constants.ShaderRegister = 0;
   root_params[3].Constants.RegisterSpace = 0;
-  root_params[3].Constants.Num32BitValues = 8;
+  root_params[3].Constants.Num32BitValues = 9;
   root_params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC rs_desc{};
   rs_desc.NumParameters = 4;
@@ -1513,17 +1538,21 @@ BackendResult NVOFOpticalFlowBackend::TryProcess(
   command_list->SetComputeRootDescriptorTable(0, gpu_view(3));
   command_list->SetComputeRootUnorderedAccessView(1, gpu_view(7).ptr);
   command_list->SetComputeRootUnorderedAccessView(2, gpu_view(8).ptr);
-  // Bind the densify cbuffer via root 32-bit constants (order matches the HLSL
-  // cbuffer DensifyConstants: gridW, gridH, workingW, workingH, gridSize,
-  // negate, costThreshold, validationFlags). validationFlags = 0x3 enables
-  // both bounds (bit0) and photometric (bit1) validation, matching Veyra's
-  // desc_.validateMotion ? 3u : 0u (Veyra defaults to validation on).
+  // Bind the densify cbuffer via root 32-bit constants (order matches the
+  // HLSL cbuffer DensifyConstants: gridW, gridH, workingW, workingH,
+  // gridSize, negate, costThreshold, validationFlags, discardSentinelBits).
+  // validationFlags = 0x3 enables both bounds (bit0) and photometric (bit1)
+  // validation, matching Veyra's desc_.validateMotion ? 3u : 0u (Veyra
+  // defaults to validation on). discardSentinelBits carries the Stage-3
+  // sentinel as IEEE-754 float bits (0.0f default = zero MV, current
+  // behavior; hardware candidates: 65504.0 / -65504.0 / NaN).
   const uint32_t kValidationFlags = 0x3;
-  const uint32_t densify_constants[8] = {grid_width_, grid_height_,
+  const uint32_t densify_constants[9] = {grid_width_, grid_height_,
                                          input_width_, input_height_,
                                          grid_size_, kNegate, kCostThreshold,
-                                         kValidationFlags};
-  command_list->SetComputeRoot32BitConstants(3, 8, densify_constants, 0);
+                                         kValidationFlags,
+                                         PackFloatBits(kDiscardSentinel)};
+  command_list->SetComputeRoot32BitConstants(3, 9, densify_constants, 0);
   command_list->Dispatch(dispatch_x, dispatch_y, 1);
 
   // Transition the ABGR8 frame pool textures back to UAV state (the next
