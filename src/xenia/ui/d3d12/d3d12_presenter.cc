@@ -594,6 +594,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
   // fg_command_list). The present section uses this to decide between the 2x
   // present (interp + real frame) and the original single present.
   bool fg_block_used = false;
+  // Letterbox rectangle (NDC) and bilinear constants for the 2x present path.
+  // Filled in the FG block (where guest_output_flow is in scope) and used by
+  // the 2x present section (the OutputReal->backbuffer re-blit) below. They
+  // MUST match the effect chain's final effect and the FG interpolated-frame
+  // blit exactly, so both presented frames share the same geometry.
+  GuestOutputPaintRectangleConstants fg_present_rect_constants{};
+  BilinearConstants fg_present_bilinear_constants{};
   constexpr float kBackBufferClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
 
   // Draw the guest output.
@@ -1383,25 +1390,45 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
                   provider_.OffsetViewDescriptor(
                       view_heap_gpu_start,
                       PaintContext::kViewIndexDLSSFgOutputSrv));
-              // Full-screen rectangle (NDC). The interp frame is at guest
-              // resolution; the bilinear effect stretches it to fill the
-              // display-resolution backbuffer.
+              // Letterbox rectangle (NDC), matching the effect chain's final
+              // effect. The FG interp frame is at the same aspect ratio as the
+              // SR output (or guest output); the bilinear effect scales it to
+              // the letterbox size within the back buffer, preserving the
+              // black bars. Using a full-screen rectangle here would stretch
+              // the interp frame to fill the entire back buffer, losing the
+              // letterbox that the SR path preserves.
               GuestOutputPaintRectangleConstants fg_rect_constants;
-              fg_rect_constants.x = -1.0f;
-              fg_rect_constants.y = 1.0f;
-              fg_rect_constants.width = 2.0f;
-              fg_rect_constants.height = -2.0f;
+              float fg_x_to_ndc = 2.0f / float(paint_context_.swap_chain_width);
+              float fg_y_to_ndc = 2.0f / float(paint_context_.swap_chain_height);
+              fg_rect_constants.x =
+                  -1.0f + float(guest_output_flow.output_x) * fg_x_to_ndc;
+              // +Y is -V.
+              fg_rect_constants.y =
+                  1.0f - float(guest_output_flow.output_y) * fg_y_to_ndc;
+              fg_rect_constants.width =
+                  float(guest_output_flow.effect_output_sizes
+                            [guest_output_flow.effect_count - 1]
+                        .first) *
+                  fg_x_to_ndc;
+              fg_rect_constants.height =
+                  -float(guest_output_flow.effect_output_sizes
+                             [guest_output_flow.effect_count - 1]
+                         .second) *
+                  fg_y_to_ndc;
               paint_context_.fg_command_list->SetGraphicsRoot32BitConstants(
                   UINT(GuestOutputPaintRootParameter::kRectangle),
                   sizeof(fg_rect_constants) / sizeof(uint32_t),
                   &fg_rect_constants, 0);
               BilinearConstants fg_bilinear_constants;
-              fg_bilinear_constants.output_offset[0] = 0;
-              fg_bilinear_constants.output_offset[1] = 0;
-              fg_bilinear_constants.output_size_inv[0] =
-                  1.0f / float(paint_context_.swap_chain_width);
-              fg_bilinear_constants.output_size_inv[1] =
-                  1.0f / float(paint_context_.swap_chain_height);
+              // Use the letterbox output offset and size (the final effect's
+              // rectangle), matching the effect chain's final effect. This
+              // preserves the black bars that the SR path preserves.
+              fg_bilinear_constants.Initialize(
+                  guest_output_flow, guest_output_flow.effect_count - 1);
+              // Hoist the letterbox constants for the 2x present section's
+              // OutputReal re-blit (guest_output_flow is out of scope there).
+              fg_present_rect_constants = fg_rect_constants;
+              fg_present_bilinear_constants = fg_bilinear_constants;
               paint_context_.fg_command_list->SetGraphicsRoot32BitConstants(
                   UINT(GuestOutputPaintRootParameter::kEffectConstants),
                   sizeof(fg_bilinear_constants) / sizeof(uint32_t),
@@ -1633,26 +1660,25 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
         UINT(GuestOutputPaintRootParameter::kSource),
         provider_.OffsetViewDescriptor(
             view_heap_gpu_start, PaintContext::kViewIndexDLSSFgOutputRealSrv));
-    GuestOutputPaintRectangleConstants second_rect_constants;
-    second_rect_constants.x = -1.0f;
-    second_rect_constants.y = 1.0f;
-    second_rect_constants.width = 2.0f;
-    second_rect_constants.height = -2.0f;
+    // Letterbox rectangle (NDC), matching the effect chain's final effect and
+    // the FG interpolated-frame blit above. The OutputReal frame is a copy of
+    // the same source the interpolated frame was generated from (the SR output
+    // when SR is on, or the guest output when SR is off), so it is at the same
+    // size and aspect ratio as the interpolated frame and must be scaled to the
+    // SAME letterbox rectangle. Using a full-screen rectangle here would
+    // stretch the real frame to fill the entire back buffer, losing the
+    // letterbox that the SR path preserves. Because the interpolated frame IS
+    // letterboxed, the two presented frames would then alternate between the
+    // letterboxed and the stretched geometry every frame - the visible shake.
+    // This was the cause of the severe jitter when FG was enabled.
     command_list->SetGraphicsRoot32BitConstants(
         UINT(GuestOutputPaintRootParameter::kRectangle),
-        sizeof(second_rect_constants) / sizeof(uint32_t),
-        &second_rect_constants, 0);
-    BilinearConstants second_bilinear_constants;
-    second_bilinear_constants.output_offset[0] = 0;
-    second_bilinear_constants.output_offset[1] = 0;
-    second_bilinear_constants.output_size_inv[0] =
-        1.0f / float(paint_context_.swap_chain_width);
-    second_bilinear_constants.output_size_inv[1] =
-        1.0f / float(paint_context_.swap_chain_height);
+        sizeof(fg_present_rect_constants) / sizeof(uint32_t),
+        &fg_present_rect_constants, 0);
     command_list->SetGraphicsRoot32BitConstants(
         UINT(GuestOutputPaintRootParameter::kEffectConstants),
-        sizeof(second_bilinear_constants) / sizeof(uint32_t),
-        &second_bilinear_constants, 0);
+        sizeof(fg_present_bilinear_constants) / sizeof(uint32_t),
+        &fg_present_bilinear_constants, 0);
     command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     command_list->DrawInstanced(4, 1, 0, 0);
     // Draw the UI on top of the real frame (N) into command_list (back buffer
