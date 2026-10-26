@@ -55,10 +55,16 @@ const D3D12_HEAP_PROPERTIES kUploadHeapProperties = {
 //   - kNegate = 0: the raw NVOF flow already points current -> previous (given
 //     inputFrame = current, referenceFrame = previous, verified by Veyra's
 //     +8px displacement test). Preserve that direction; do NOT negate.
-//   - kCostThreshold = 128: cells with cost >= 128 (confidence <= 0.49) are
-//     zeroed. Cost is a rejection signal (higher cost = less reliable).
+//   - kCostThreshold = 32: cells with cost >= 32 (confidence <= ~0.88) are
+//     zeroed. Cost is a rejection signal (higher cost = less reliable). This
+//     matches Veyra's verified densify threshold (EnhanceGraph dc[6]=32). The
+//     higher prior value (128) kept unreliable low-confidence MVs as nonzero,
+//     which DLSS SR smeared during temporal reprojection on rapidly changing
+//     UI (speedometer/altimeter). Zeroing more aggressively reduces smear at
+//     the cost of more ghosting (a zero MV reprojects stale history from the
+//     same position); this is the verified Veyra reference point.
 const uint32_t kNegate = 0;
-const uint32_t kCostThreshold = 128;
+const uint32_t kCostThreshold = 32;
 
 // ---------------------------------------------------------------------------
 // Embedded HLSL shaders (compiled at runtime via D3DCompile).
@@ -92,6 +98,8 @@ void main(uint3 globalId : SV_DispatchThreadID)
 const char kDensifyHlsl[] = R"(
 Texture2D<int2> rawFlow : register(t0);
 Texture2D<uint> rawCost : register(t1);
+Texture2D<float4> previousColor : register(t2);   // ABGR8 previous frame
+Texture2D<float4> currentColor : register(t3);    // ABGR8 current frame
 RWTexture2D<float2> flowOut : register(u0);
 RWTexture2D<float> confOut : register(u1);
 
@@ -104,6 +112,7 @@ cbuffer DensifyConstants : register(b0)
     uint gridSize;
     uint negate;
     uint costThreshold;
+    uint validationFlags;   // bit0 bounds, bit1 photometric (Veyra convention)
 }
 
 [numthreads(8, 8, 1)]
@@ -118,6 +127,29 @@ void main(uint3 globalId : SV_DispatchThreadID)
     uint cost = rawCost[uint2(gx, gy)];
     float confidence = float(255u - min(cost, 255u)) / 255.0;
     if (cost >= costThreshold) { v = float2(0, 0); confidence = 0.0; }
+    else if (validationFlags != 0) {
+        // Photometric/bounds validation (ported from Veyra's NvofDensify.hlsl):
+        // reject out-of-frame reprojections and gate large luma disagreement.
+        // The ABGR8 textures are sampled as (B, G, R, A), so .rgb is (B, G, R);
+        // the luma weights are applied to that order, matching Veyra's behavior.
+        float2 q = float2(globalId.xy) + v;
+        bool outside = any(q < 0) || any(q > float2(workingW - 1, workingH - 1));
+        if ((validationFlags & 1) != 0 && outside) { v = float2(0, 0); confidence = 0.0; }
+        else if ((validationFlags & 2) != 0) {
+            int2 a = (int2)floor(q);
+            float2 t = frac(q);
+            int2 limit = int2(workingW - 1, workingH - 1);
+            float3 top    = lerp(previousColor[clamp(a, int2(0,0), limit)].rgb,
+                                 previousColor[clamp(a + int2(1,0), int2(0,0), limit)].rgb, t.x);
+            float3 bottom = lerp(previousColor[clamp(a + int2(0,1), int2(0,0), limit)].rgb,
+                                 previousColor[clamp(a + int2(1,1), int2(0,0), limit)].rgb, t.x);
+            float error = abs(dot(currentColor[globalId.xy].rgb - lerp(top, bottom, t.y),
+                                  float3(.2126, .7152, .0722)));
+            float trust = 1.0 - smoothstep(.03, .15, error);
+            v *= trust;
+            confidence *= trust;
+        }
+    }
     flowOut[globalId.xy] = v;
     confOut[globalId.xy] = confidence;
 }
@@ -882,19 +914,21 @@ BackendResult NVOFOpticalFlowBackend::Initialize(
   XELOGI("NVOF: input/output fences created (output starts at value 1).");
 
   // 12. Create the private view heap + root signature.
-  //     Descriptor layout (7 descriptors, indices 0..6):
+  //     Descriptor layout (9 descriptors, indices 0..8):
   //       0: input frame SRV        (conversion t0)
   //       1: (reserved)
   //       2: frame pool UAV         (conversion u0)
   //       3: grid flow SRV          (densify t0)
   //       4: grid cost SRV          (densify t1)
-  //       5: motion vector UAV      (densify u0)
-  //       6: confidence UAV         (densify u1)
-  //     Root signature: [0] SRV descriptor table (t0/t1), [1] UAV u0,
-  //     [2] UAV u1, [3] 32-bit constants (7, densify cbuffer b0).
+  //       5: ABGR8 previous SRV     (densify t2, validation)
+  //       6: ABGR8 current SRV      (densify t3, validation)
+  //       7: motion vector UAV      (densify u0)
+  //       8: confidence UAV         (densify u1)
+  //     Root signature: [0] SRV descriptor table (t0/t1/t2/t3), [1] UAV u0,
+  //     [2] UAV u1, [3] 32-bit constants (8, densify cbuffer b0).
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  heap_desc.NumDescriptors = 7;
+  heap_desc.NumDescriptors = 9;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (FAILED(device_->CreateDescriptorHeap(&heap_desc,
                                            IID_PPV_ARGS(&view_heap_)))) {
@@ -904,10 +938,11 @@ BackendResult NVOFOpticalFlowBackend::Initialize(
     return BackendResult::kInitFailed;
   }
   // Root signature for the densify pass:
-  //   [0] SRV descriptor table (t0 = grid-flow, t1 = grid-cost),
+  //   [0] SRV descriptor table (t0 = grid-flow, t1 = grid-cost,
+  //       t2 = ABGR8 previous, t3 = ABGR8 current, for validation),
   //   [1] UAV root descriptor (u0 = full-resolution MV),
   //   [2] UAV root descriptor (u1 = confidence),
-  //   [3] 32-bit constants (b0, the densify cbuffer: 7 values).
+  //   [3] 32-bit constants (b0, the densify cbuffer: 8 values).
   //
   // NOTE: this Windows SDK's D3D12_ROOT_PARAMETER is the classic layout -
   // a struct with ParameterType, an anonymous union (.DescriptorTable /
@@ -918,7 +953,7 @@ BackendResult NVOFOpticalFlowBackend::Initialize(
   // (.pDescriptorRanges / .NumDescriptorRanges), not NumDescriptors.
   D3D12_DESCRIPTOR_RANGE srv_range{};
   srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  srv_range.NumDescriptors = 2;
+  srv_range.NumDescriptors = 4;
   srv_range.BaseShaderRegister = 0;
   srv_range.RegisterSpace = 0;
   srv_range.OffsetInDescriptorsFromTableStart = 0;
@@ -938,7 +973,7 @@ BackendResult NVOFOpticalFlowBackend::Initialize(
   root_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   root_params[3].Constants.ShaderRegister = 0;
   root_params[3].Constants.RegisterSpace = 0;
-  root_params[3].Constants.Num32BitValues = 7;
+  root_params[3].Constants.Num32BitValues = 8;
   root_params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC rs_desc{};
   rs_desc.NumParameters = 4;
@@ -1432,26 +1467,84 @@ BackendResult NVOFOpticalFlowBackend::TryProcess(
   D3D12_CPU_DESCRIPTOR_HANDLE grid_cost_srv = cpu_view(4);
   device_->CreateShaderResourceView(grid_cost_texture_.Get(), nullptr,
                                     grid_cost_srv);
-  D3D12_CPU_DESCRIPTOR_HANDLE mv_uav = cpu_view(5);
+  // ABGR8 previous/current SRVs for the photometric/bounds validation (t2/t3).
+  // These are the same textures the conversion pass writes (frame_pool_[]),
+  // now bound as SRVs for the densify pass to read.
+  D3D12_CPU_DESCRIPTOR_HANDLE prev_color_srv = cpu_view(5);
+  device_->CreateShaderResourceView(frame_pool_[previous_index].Get(), nullptr,
+                                    prev_color_srv);
+  D3D12_CPU_DESCRIPTOR_HANDLE curr_color_srv = cpu_view(6);
+  device_->CreateShaderResourceView(frame_pool_[current_index].Get(), nullptr,
+                                    curr_color_srv);
+  D3D12_CPU_DESCRIPTOR_HANDLE mv_uav = cpu_view(7);
   device_->CreateUnorderedAccessView(motion_vector_texture_.Get(), nullptr,
                                      nullptr, mv_uav);
-  D3D12_CPU_DESCRIPTOR_HANDLE conf_uav = cpu_view(6);
+  D3D12_CPU_DESCRIPTOR_HANDLE conf_uav = cpu_view(8);
   device_->CreateUnorderedAccessView(confidence_texture_.Get(), nullptr,
                                      nullptr, conf_uav);
+
+  // The ABGR8 frame pool textures are in UAV state (the conversion pass wrote
+  // them as unordered access, and the NVOF OF engine restores them to the
+  // registered UAV state after execute). Transition them to
+  // NON_PIXEL_SHADER_RESOURCE so the densify pass can read them as SRVs for
+  // the photometric/bounds validation. On the first frame
+  // (previous_index == current_index) both indices refer to the same texture,
+  // so only one barrier is recorded (a double transition of the same resource
+  // would be an invalid state change).
+  {
+    D3D12_RESOURCE_BARRIER densify_barriers[2] = {};
+    uint32_t num_barriers = 0;
+    auto make_transition = [&](uint32_t pool_index) {
+      D3D12_RESOURCE_BARRIER& b = densify_barriers[num_barriers];
+      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      b.Transition.pResource = frame_pool_[pool_index].Get();
+      b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      ++num_barriers;
+    };
+    make_transition(previous_index);
+    if (current_index != previous_index) make_transition(current_index);
+    command_list->ResourceBarrier(num_barriers, densify_barriers);
+  }
 
   command_list->SetComputeRootSignature(root_signature_.Get());
   command_list->SetPipelineState(densify_pso_.Get());
   command_list->SetComputeRootDescriptorTable(0, gpu_view(3));
-  command_list->SetComputeRootUnorderedAccessView(1, gpu_view(5).ptr);
-  command_list->SetComputeRootUnorderedAccessView(2, gpu_view(6).ptr);
+  command_list->SetComputeRootUnorderedAccessView(1, gpu_view(7).ptr);
+  command_list->SetComputeRootUnorderedAccessView(2, gpu_view(8).ptr);
   // Bind the densify cbuffer via root 32-bit constants (order matches the HLSL
   // cbuffer DensifyConstants: gridW, gridH, workingW, workingH, gridSize,
-  // negate, costThreshold).
-  const uint32_t densify_constants[7] = {grid_width_, grid_height_,
+  // negate, costThreshold, validationFlags). validationFlags = 0x3 enables
+  // both bounds (bit0) and photometric (bit1) validation, matching Veyra's
+  // desc_.validateMotion ? 3u : 0u (Veyra defaults to validation on).
+  const uint32_t kValidationFlags = 0x3;
+  const uint32_t densify_constants[8] = {grid_width_, grid_height_,
                                          input_width_, input_height_,
-                                         grid_size_, kNegate, kCostThreshold};
-  command_list->SetComputeRoot32BitConstants(3, 7, densify_constants, 0);
+                                         grid_size_, kNegate, kCostThreshold,
+                                         kValidationFlags};
+  command_list->SetComputeRoot32BitConstants(3, 8, densify_constants, 0);
   command_list->Dispatch(dispatch_x, dispatch_y, 1);
+
+  // Transition the ABGR8 frame pool textures back to UAV state (the next
+  // frame's conversion pass and NVOF execute will use them as UAVs). Same
+  // first-frame handling as above (only one barrier when the indices coincide).
+  {
+    D3D12_RESOURCE_BARRIER densify_barriers_back[2] = {};
+    uint32_t num_barriers_back = 0;
+    auto make_transition_back = [&](uint32_t pool_index) {
+      D3D12_RESOURCE_BARRIER& b = densify_barriers_back[num_barriers_back];
+      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      b.Transition.pResource = frame_pool_[pool_index].Get();
+      b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      ++num_barriers_back;
+    };
+    make_transition_back(previous_index);
+    if (current_index != previous_index) make_transition_back(current_index);
+    command_list->ResourceBarrier(num_barriers_back, densify_barriers_back);
+  }
 
   // Update the valid-flow flag. The first frame (frame_index == 0) has an
   // invalid flow (no valid reference); subsequent frames are valid.
