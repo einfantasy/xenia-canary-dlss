@@ -1409,21 +1409,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
               paint_context_.fg_command_list->IASetPrimitiveTopology(
                   D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
               paint_context_.fg_command_list->DrawInstanced(4, 1, 0, 0);
-              // Transition the back buffer to PRESENT (the FG list is executed
-              // last, so the final barrier must be here, not in command_list).
-              D3D12_RESOURCE_BARRIER fg_barrier_rtv_to_present;
-              fg_barrier_rtv_to_present.Type =
-                  D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-              fg_barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-              fg_barrier_rtv_to_present.Transition.pResource = back_buffer;
-              fg_barrier_rtv_to_present.Transition.Subresource =
-                  D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-              fg_barrier_rtv_to_present.Transition.StateBefore =
-                  D3D12_RESOURCE_STATE_RENDER_TARGET;
-              fg_barrier_rtv_to_present.Transition.StateAfter =
-                  D3D12_RESOURCE_STATE_PRESENT;
-              paint_context_.fg_command_list->ResourceBarrier(
-                  1, &fg_barrier_rtv_to_present);
+              // NOTE: the RTV->PRESENT barrier for the back buffer is NOT
+              // recorded here. It is recorded in the 2x present section below
+              // (after the UI draw), so the UI can be drawn on top of the
+              // interpolated frame before the back buffer transitions to
+              // PRESENT. (The FG list is executed last, so the final barrier
+              // must be in this list, not in command_list.)
             } else {
               // FG failure: reset the FG command list to discard the recorded
               // FG commands. The effect chain (in command_list) already painted
@@ -1489,8 +1480,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
     back_buffer_clear_needed = false;
   }
 
-  if (execute_ui_drawers) {
-    // Draw the UI.
+  // Draw the UI. When the FG block (Milestone 5-C) is used, the 2x present
+  // path below draws the UI on top of EACH presented back buffer (the
+  // interpolated frame and the real frame) after their final content blit, so
+  // the UI is not drawn here (it would be overwritten by the FG interpolated
+  // frame blit on the first back buffer, and the second back buffer would
+  // never receive it).
+  if (execute_ui_drawers && !fg_block_used) {
     if (!back_buffer_bound) {
       command_list->OMSetRenderTargets(1, &back_buffer_rtv, true, nullptr);
       back_buffer_bound = true;
@@ -1509,16 +1505,45 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
   if (fg_block_used) {
     // --- 2x present path (Milestone 5-C). ---
     // The effect chain (the real frame N) is in command_list; the FG block
-    // (the FG Evaluate + the interp->backbuffer blit + the RTV->PRESENT
-    // barrier) is in fg_command_list. Execute the main list first (painting
-    // the real frame N into the back buffer), then the FG list (the FG
-    // Evaluate reads N, generates the interpolated frame N-0.5, and blits it
-    // into the back buffer). After both, the back buffer holds N-0.5 in
-    // PRESENT state. Present it. Then re-record the OutputReal->backbuffer
-    // blit (the real frame N) into command_list (Reset, after awaiting the
-    // effect chain to complete on the GPU), execute it, and present the real
-    // frame N. The swap chain advances one back buffer per Present, so the
-    // second present targets the next back buffer (re-acquired below).
+    // (the FG Evaluate + the interp->backbuffer blit) is in fg_command_list.
+    // Execute the main list first (painting the real frame N into the back
+    // buffer), then the FG list (the FG Evaluate reads N, generates the
+    // interpolated frame N-0.5, and blits it into the back buffer). The UI
+    // (if any) is drawn on top of the interpolated frame (into
+    // fg_command_list, after the FG blit), then the back buffer is
+    // transitioned to PRESENT. Present it. Then re-record the
+    // OutputReal->backbuffer blit (the real frame N) plus the UI (if any)
+    // into command_list (Reset, after awaiting the effect chain to complete
+    // on the GPU), execute it, and present the real frame N. The swap chain
+    // advances one back buffer per Present, so the second present targets the
+    // next back buffer (re-acquired below).
+    // Draw the UI on top of the interpolated frame (N-0.5) into
+    // fg_command_list (back buffer A is still bound as the RT there, right
+    // after the FG blit), then transition the back buffer to PRESENT. The
+    // RTV->PRESENT barrier was moved here from the FG block so the UI is
+    // drawn before the transition.
+    if (execute_ui_drawers) {
+      D3D12UIDrawContext ui_draw_context(
+          *this, paint_context_.swap_chain_width,
+          paint_context_.swap_chain_height,
+          paint_context_.fg_command_list.Get(),
+          ui_completion_timeline_->GetUpcomingSubmission(),
+          ui_completion_timeline_->UpdateAndGetCompletedSubmission());
+      ExecuteUIDrawersFromUIThread(ui_draw_context);
+    }
+    D3D12_RESOURCE_BARRIER fg_barrier_rtv_to_present;
+    fg_barrier_rtv_to_present.Type =
+        D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    fg_barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    fg_barrier_rtv_to_present.Transition.pResource = back_buffer;
+    fg_barrier_rtv_to_present.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    fg_barrier_rtv_to_present.Transition.StateBefore =
+        D3D12_RESOURCE_STATE_RENDER_TARGET;
+    fg_barrier_rtv_to_present.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_PRESENT;
+    paint_context_.fg_command_list->ResourceBarrier(
+        1, &fg_barrier_rtv_to_present);
     command_list->Close();
     paint_context_.fg_command_list->Close();
     ID3D12CommandList* execute_lists[2] = {
@@ -1630,6 +1655,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
         &second_bilinear_constants, 0);
     command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     command_list->DrawInstanced(4, 1, 0, 0);
+    // Draw the UI on top of the real frame (N) into command_list (back buffer
+    // B is still bound as the RT there, right after the OutputReal blit).
+    if (execute_ui_drawers) {
+      D3D12UIDrawContext ui_draw_context(
+          *this, paint_context_.swap_chain_width,
+          paint_context_.swap_chain_height, command_list,
+          ui_completion_timeline_->GetUpcomingSubmission(),
+          ui_completion_timeline_->UpdateAndGetCompletedSubmission());
+      ExecuteUIDrawersFromUIThread(ui_draw_context);
+    }
     D3D12_RESOURCE_BARRIER second_barrier_rtv_to_present;
     second_barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     second_barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
