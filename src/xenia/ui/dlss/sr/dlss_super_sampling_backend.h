@@ -19,6 +19,7 @@
 // sets NOMINMAX before windows.h is reached. Including wrl/client.h first
 // would let windows.h define the min/max macros too early (C2589).
 #include "xenia/ui/guest_output_enhancement.h"
+#include "xenia/ui/dlss/ngx/ngx_core_host.h"
 
 // ComPtr is available transitively through the chain above, but the backend
 // owns a ComPtr member directly, so include it explicitly (after the Xenia
@@ -97,9 +98,16 @@ class DLSSSuperSamplingBackend final : public IDLSSSuperSamplingBackend {
   // and matches by LUID (ID3D12Device3::GetAdapterLuid) to find the physical
   // adapter `device` sits on; it is used only for the capability check and
   // released immediately after.
+  // `core_host` is the shared NGX core owner (Milestone 5-B, prerequisite
+  // P0-1). The backend acquires/releases the shared NGX core through it
+  // instead of calling Init_with_ProjectID / Shutdown1 / AllocateParameters /
+  // DestroyParameters itself. The core host is non-owning (the presenter owns
+  // it) and is shared with the DLSS Frame Generation backend, so the core
+  // Shutdown1 runs only when the last consumer releases.
   DLSSSuperSamplingBackend(ID3D12Device* device,
                            std::vector<std::wstring> runtime_dirs,
                            std::wstring config_path,
+                           NgxCoreHost* core_host,
                            ui::DlssSrPerfQuality perf_quality);
   ~DLSSSuperSamplingBackend() override;
 
@@ -168,6 +176,11 @@ class DLSSSuperSamplingBackend final : public IDLSSSuperSamplingBackend {
   ID3D12Device* device_;
   std::vector<std::wstring> runtime_dirs_;
   std::wstring config_path_;
+  // The shared NGX core owner (non-owning; the presenter owns it). The backend
+  // acquires/releases the core through it (Milestone 5-B). The core host is
+  // shared with the DLSS Frame Generation backend, so the core Shutdown1 runs
+  // only when the last consumer releases.
+  NgxCoreHost* core_host_;
   // Quality preset used by Initialize() when filling the create parameters.
   // The quality preset the current feature was created with. Initialized to the
   // constructor's quality; updated by Initialize() on every (re-)creation. A

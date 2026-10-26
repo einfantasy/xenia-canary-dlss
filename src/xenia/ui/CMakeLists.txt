@@ -18,13 +18,17 @@ endif()
 xe_target_defaults(xenia-ui)
 
 if(WIN32)
-  # DLSS SR backend (Milestone 3-B). Windows-only (D3D12). Depends only on
-  # xenia-base; the SDK headers are referenced by path, not copied.
+  # NVIDIA graphics-enhancement backends and the shared NGX core owner.
+  # Windows-only (D3D12). Groups independent, license-isolated backends under
+  # dlss/ (see dlss/CMakeLists.txt for the per-backend details):
+  #   - dlss/ngx  -> shared NGX core owner (Milestone 5-B), target xenia-ngx
+  #   - dlss/sr   -> DLSS super-sampling (Milestone 3-B), target xenia-dlss
+  #   - dlss/fg   -> DLSS frame generation / DLSSG (Milestone 5-B), target xenia-fg
+  #   - dlss/nvof -> NVIDIA optical flow (Milestone 4-D), target xenia-nvof
+  # The NGX core is added first inside dlss/ so the SR and FG backends can
+  # link against it. Each backend depends only on xenia-base (SR/FG also on
+  # xenia-ngx); the SDK headers are referenced by path, not copied.
   add_subdirectory(dlss)
-  # NVOF (NVIDIA Optical Flow) backend (Milestone 4-D). Windows-only (D3D12).
-  # Depends only on xenia-base; the SDK headers are referenced by path, not
-  # copied. Independent module - orthogonal to the DLSS SR backend.
-  add_subdirectory(nvof)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

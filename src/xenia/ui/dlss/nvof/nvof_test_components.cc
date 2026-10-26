@@ -7,7 +7,7 @@
  ******************************************************************************
  */
 
-#include "xenia/ui/nvof/nvof_test_components.h"
+#include "xenia/ui/dlss/nvof/nvof_test_components.h"
 
 #include <algorithm>
 #include <cmath>

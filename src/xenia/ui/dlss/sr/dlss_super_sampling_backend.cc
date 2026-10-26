@@ -7,7 +7,7 @@
  ******************************************************************************
  */
 
-#include "xenia/ui/dlss/dlss_super_sampling_backend.h"
+#include "xenia/ui/dlss/sr/dlss_super_sampling_backend.h"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -128,50 +128,6 @@ __declspec(noinline) NVSDK_NGX_Result CallGetFeatureRequirements(
   return result;
 }
 
-__declspec(noinline) NVSDK_NGX_Result CallInitWithProjectId(
-    const char* project_id, const char* engine_version,
-    const wchar_t* app_data_path,
-    const NVSDK_NGX_FeatureCommonInfo* feature_info,
-    ID3D12Device* device, uint32_t& seh_code) {
-  seh_code = 0;
-  NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
-  __try {
-    result = NVSDK_NGX_D3D12_Init_with_ProjectID(
-        project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_version, app_data_path, device,
-        feature_info, NVSDK_NGX_Version_API);
-  }
-  __except (EXCEPTION_EXECUTE_HANDLER) {
-    seh_code = static_cast<uint32_t>(GetExceptionCode());
-  }
-  return result;
-}
-
-__declspec(noinline) NVSDK_NGX_Result CallAllocateParameters(
-    NVSDK_NGX_Parameter** out_parameters, uint32_t& seh_code) {
-  seh_code = 0;
-  NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
-  __try {
-    result = NVSDK_NGX_D3D12_AllocateParameters(out_parameters);
-  }
-  __except (EXCEPTION_EXECUTE_HANDLER) {
-    seh_code = static_cast<uint32_t>(GetExceptionCode());
-  }
-  return result;
-}
-
-__declspec(noinline) NVSDK_NGX_Result CallDestroyParameters(
-    NVSDK_NGX_Parameter* parameters, uint32_t& seh_code) {
-  seh_code = 0;
-  NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
-  __try {
-    result = NVSDK_NGX_D3D12_DestroyParameters(parameters);
-  }
-  __except (EXCEPTION_EXECUTE_HANDLER) {
-    seh_code = static_cast<uint32_t>(GetExceptionCode());
-  }
-  return result;
-}
-
 __declspec(noinline) NVSDK_NGX_Result CallCreateDlss(
     ID3D12GraphicsCommandList* command_list, NVSDK_NGX_Handle** out_handle,
     NVSDK_NGX_Parameter* parameter_block,
@@ -210,19 +166,6 @@ __declspec(noinline) NVSDK_NGX_Result CallReleaseFeature(
   NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
   __try {
     result = NVSDK_NGX_D3D12_ReleaseFeature(handle);
-  }
-  __except (EXCEPTION_EXECUTE_HANDLER) {
-    seh_code = static_cast<uint32_t>(GetExceptionCode());
-  }
-  return result;
-}
-
-__declspec(noinline) NVSDK_NGX_Result CallShutdown1(ID3D12Device* device,
-                                                    uint32_t& seh_code) {
-  seh_code = 0;
-  NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
-  __try {
-    result = NVSDK_NGX_D3D12_Shutdown1(device);
   }
   __except (EXCEPTION_EXECUTE_HANDLER) {
     seh_code = static_cast<uint32_t>(GetExceptionCode());
@@ -295,10 +238,12 @@ const char* PerfQualityName(ui::DlssSrPerfQuality quality) {
 
 DLSSSuperSamplingBackend::DLSSSuperSamplingBackend(
     ID3D12Device* device, std::vector<std::wstring> runtime_dirs,
-    std::wstring config_path, ui::DlssSrPerfQuality perf_quality)
+    std::wstring config_path, NgxCoreHost* core_host,
+    ui::DlssSrPerfQuality perf_quality)
     : device_(device),
       runtime_dirs_(std::move(runtime_dirs)),
       config_path_(std::move(config_path)),
+      core_host_(core_host),
       created_perf_quality_(perf_quality) {}
 
 DLSSSuperSamplingBackend::~DLSSSuperSamplingBackend() { Shutdown(); }
@@ -330,15 +275,11 @@ void DLSSSuperSamplingBackend::Shutdown() {
   XELOGI("DLSS SR: backend shutdown (input={}x{}, output={}x{}).",
          input_width_, input_height_, output_width_, output_height_);
   ReleaseFeature();
-  uint32_t seh_code = 0;
-  NVSDK_NGX_Result shutdown_result = CallShutdown1(device_, seh_code);
-  if (shutdown_result != NVSDK_NGX_Result_Success) {
-    XELOGW("DLSS SR: SDK Shutdown1 failed (result={}, seh=0x{:08X}); the SDK "
-           "session is discarded anyway.",
-           static_cast<int>(shutdown_result), seh_code);
-  } else {
-    XELOGI("DLSS SR: SDK Shutdown1 succeeded.");
-  }
+  // Release the shared NGX core through the core owner (Milestone 5-B). The
+  // core host performs the Shutdown1 (SEH boundary) only when the reference
+  // count reaches zero (the DLSS FG backend may still hold a reference). The
+  // core owner logs its own Shutdown1 result.
+  core_host_->Release(device_);
   g_ngx_device = nullptr;
   output_texture_.Reset();
   upload_buffer_.Reset();
@@ -365,16 +306,9 @@ void DLSSSuperSamplingBackend::ReleaseFeature() {
     feature_handle_ = nullptr;
   }
   if (parameter_block_) {
-    uint32_t seh_code = 0;
-    NVSDK_NGX_Result destroy_result =
-        CallDestroyParameters(parameter_block_, seh_code);
-    if (destroy_result != NVSDK_NGX_Result_Success) {
-      XELOGW("DLSS SR: DestroyParameters failed (result={}, seh=0x{:08X}); the "
-             "parameter block is discarded anyway.",
-             static_cast<int>(destroy_result), seh_code);
-    } else {
-      XELOGD("DLSS SR: DestroyParameters succeeded.");
-    }
+    // Destroy the parameter block through the core owner (Milestone 5-B). The
+    // core owner wraps DestroyParameters in a SEH boundary and logs its result.
+    core_host_->DestroyParameters(parameter_block_);
     parameter_block_ = nullptr;
   }
 }
@@ -626,31 +560,39 @@ BackendResult DLSSSuperSamplingBackend::Initialize(
          static_cast<int>(requirement_result),
          static_cast<int>(requirement.FeatureSupported));
 
-  // 2. Initialize the SDK session (CPU side).
-  XELOGD("DLSS SR: SDK Init_with_ProjectID start (path_list_length={}).",
-         path_list_length);
-  NVSDK_NGX_Result init_result = CallInitWithProjectId(
-      project_id.c_str(), engine_version.c_str(), runtime_dirs_[0].c_str(),
-      &discovery_common, device_, seh_code);
-  if (init_result != NVSDK_NGX_Result_Success) {
-    XELOGE("DLSS SR: SDK Init failed (result={}, seh=0x{:08X}).",
-           static_cast<int>(init_result), seh_code);
+  // 2. Initialize the shared NGX core through the core owner (Milestone 5-B).
+  //    The core owner performs the Init_with_ProjectID (SEH boundary) with the
+  //    runtime directories and project identity. It initializes the core only
+  //    if a previous consumer (the DLSS FG backend) has not already done so,
+  //    and increments the reference count. On failure the reference count is
+  //    unchanged and the raw SDK result is returned.
+  XELOGD("DLSS SR: core Acquire start (path_list_length={}).", path_list_length);
+  NgxCoreAcquireResult acquire_result =
+      core_host_->Acquire(device_, runtime_dirs_, project_id, engine_version);
+  if (acquire_result.result != 0) {  // 0 = NVSDK_NGX_Result_Success.
+    XELOGE("DLSS SR: core Acquire failed (result={}, seh=0x{:08X}).",
+           acquire_result.result, acquire_result.seh_code);
     state_ = State::kUnavailable;
-    return InitFailureToBackendResult(init_result);
+    return InitFailureToBackendResult(
+        static_cast<NVSDK_NGX_Result>(acquire_result.result));
   }
   g_ngx_device = device_;
-  XELOGD("DLSS SR: SDK Init succeeded.");
+  XELOGD("DLSS SR: core Acquire succeeded (core_initialized={}).",
+         acquire_result.core_initialized);
 
   // 3. Allocate the parameter block (CPU side).
   XELOGD("DLSS SR: AllocateParameters start.");
-  NVSDK_NGX_Result alloc_result = CallAllocateParameters(&parameter_block_,
-                                                        seh_code);
-  if (alloc_result != NVSDK_NGX_Result_Success || !parameter_block_) {
-    XELOGE("DLSS SR: parameter block allocation failed (result={}, "
-           "seh=0x{:08X}).",
-           static_cast<int>(alloc_result), seh_code);
+  // Allocate the parameter block through the core owner (Milestone 5-B). The
+  // core owner wraps AllocateParameters in a SEH boundary and returns nullptr
+  // on failure (it logs its own result). A failure here is a generic init
+  // failure (the specific SDK result is not propagated through the core owner).
+  uint32_t alloc_seh = 0;
+  parameter_block_ = core_host_->AllocateParameters(&alloc_seh);
+  if (!parameter_block_) {
+    XELOGE("DLSS SR: parameter block allocation failed (seh=0x{:08X}).",
+           alloc_seh);
     state_ = State::kUnavailable;
-    return InitFailureToBackendResult(alloc_result);
+    return BackendResult::kInitFailed;
   }
   // Register the resource allocation / release callbacks so the SDK can
   // allocate its internal resources. (SDK guide section 6.2.)

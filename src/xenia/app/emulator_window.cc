@@ -164,6 +164,16 @@ DEFINE_bool(
     "estimated flow feeds the DLSS SR backend as its external motion-vector "
     "input; it is not a native guest motion vector.",
     "Display");
+DEFINE_bool(
+    dlss_frame_generation_enabled, false,
+    "DLSS Frame Generation (FG / DLSSG) sub-switch. Only effective when "
+    "dlss_enabled is true. When enabled together with the master switch, the "
+    "D3D12 presenter lazily creates the FG backend on the first frame; if the "
+    "NVIDIA FG runtime is missing or initialization fails, it deterministically "
+    "falls back to the original render path (the single-present path). On "
+    "success the presenter presents the interpolated frame (N-0.5) then the "
+    "real frame (N), doubling the presented frame rate.",
+    "Display");
 DEFINE_string(
     dlss_sr_perf_quality, "balanced",
     "DLSS Super Resolution quality preset. Only effective when dlss_sr_enabled "
@@ -658,6 +668,13 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
         bool new_optical_flow = new_enhancement_config.optical_flow_enabled;
         ImGui::Checkbox("Optical Flow", &new_optical_flow);
         new_enhancement_config.optical_flow_enabled = new_optical_flow;
+        // The frame-generation (FG) sub-switch is only drawn (and only
+        // changeable) while the DLSS radio is selected (master on), same
+        // semantics as the SR and OF sub-switches. On success the presenter
+        // presents the interpolated frame (N-0.5) then the real frame (N).
+        bool new_frame_generation = new_enhancement_config.frame_generation_enabled;
+        ImGui::Checkbox("Frame Generation", &new_frame_generation);
+        new_enhancement_config.frame_generation_enabled = new_frame_generation;
       }
 #endif
 
@@ -818,6 +835,14 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
               new_enhancement_config.optical_flow_enabled) {
         OVERRIDE_bool(dlss_optical_flow_enabled,
                       new_enhancement_config.optical_flow_enabled);
+      }
+      // Only persist the frame-generation sub-switch when the master is on
+      // (same semantics as the SR and OF sub-switches).
+      if (new_enhancement_config.master_enabled &&
+          cvars_enhancement_config.frame_generation_enabled !=
+              new_enhancement_config.frame_generation_enabled) {
+        OVERRIDE_bool(dlss_frame_generation_enabled,
+                      new_enhancement_config.frame_generation_enabled);
       }
       // Only persist the SR quality preset while the SR sub-switch is on (the
       // slider is only drawn and changeable in that case).
@@ -1389,8 +1414,11 @@ EmulatorWindow::GetGuestOutputEnhancementConfigForCvars() {
       GetDlssSrPerfQualityForCvarValue(cvars::dlss_sr_perf_quality);
     enhancement_config.render_preset =
         GetDlssSrRenderPresetForCvarValue(cvars::dlss_sr_render_preset);
-  // Frame Generation / experimental neural rendering sub-switches are not
-  // exposed in the UI yet (Phase 2+); keep them at their default-off.
+  // The frame-generation sub-switch (Milestone 5-C) is exposed in the UI. The
+  // experimental neural rendering sub-switch is not exposed yet (Phase 2+);
+  // keep it at its default-off.
+  enhancement_config.frame_generation_enabled =
+      cvars::dlss_frame_generation_enabled;
   return enhancement_config;
 }
 

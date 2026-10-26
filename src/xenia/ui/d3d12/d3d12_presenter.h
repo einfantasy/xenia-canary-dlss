@@ -18,10 +18,11 @@
 #include <vector>
 
 #include "xenia/base/math.h"
-#include "xenia/ui/dlss/dlss_super_sampling_backend.h"
+#include "xenia/ui/dlss/sr/dlss_super_sampling_backend.h"
 #include "xenia/ui/d3d12/d3d12_gpu_completion_timeline.h"
 #include "xenia/ui/d3d12/d3d12_provider.h"
 #include "xenia/ui/guest_output_enhancement.h"
+#include "xenia/ui/dlss/ngx/ngx_core_host.h"
 #include "xenia/ui/presenter.h"
 #include "xenia/ui/surface.h"
 
@@ -230,7 +231,19 @@ class D3D12Presenter final : public Presenter {
       kViewIndexDLSSSrOutputSrv =
           kViewIndexGuestOutputIntermediate0Srv + kMaxGuestOutputPaintEffects - 1,
 
-      kViewCount = kViewIndexDLSSSrOutputSrv + 1,
+      // SRV of the DLSS FG backend's interpolated-output texture (the generated
+      // frame N-0.5). Only written when the FG backend is active and produced
+      // usable output; the FG paint pass reads from it (before presenting the
+      // real frame).
+      kViewIndexDLSSFgOutputSrv = kViewIndexDLSSSrOutputSrv + 1,
+
+      // SRV of the DLSS FG backend's OutputReal texture (the SDK's copy of the
+      // real frame N). Only written when the FG backend is active; the FG paint
+      // pass reads from it when presenting the real frame (instead of the
+      // backbuffer's own content).
+      kViewIndexDLSSFgOutputRealSrv = kViewIndexDLSSFgOutputSrv + 1,
+
+      kViewCount = kViewIndexDLSSFgOutputRealSrv + 1,
     };
 
     void AwaitSwapChainUsageCompletion() {
@@ -262,6 +275,22 @@ class D3D12Presenter final : public Presenter {
                kSwapChainBufferCount>
         command_allocators;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
+    // Separate command list for the FG block (Milestone 5-C). The FG Evaluate
+    // and the interp->backbuffer draw are recorded here (NOT into the main
+    // command_list) so that an FG GPU-side failure discards only the FG
+    // commands, leaving the effect chain (in command_list) intact. The main
+    // command list is executed first (painting the real frame N into the
+    // backbuffer), then this command list (the FG Evaluate reading the
+    // backbuffer + the interp->backbuffer draw). The second present (the real
+    // frame N from OutputReal) reuses command_list (re-recorded).
+    // A ring of command allocators (one per in-flight frame), like
+    // command_allocators, so the fg_command_list can be Reset every frame
+    // without discarding the previous frame's in-flight FG commands. Indexed
+    // by the current paint submission modulo the ring size.
+    std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>,
+               kSwapChainBufferCount>
+        fg_command_allocators;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> fg_command_list;
 
     // Descriptor heaps for views of the current resources related to the guest
     // output and to painting, updated either during painting or during
@@ -303,7 +332,14 @@ class D3D12Presenter final : public Presenter {
 
   explicit D3D12Presenter(HostGpuLossCallback host_gpu_loss_callback,
                           const D3D12Provider& provider)
-      : Presenter(host_gpu_loss_callback), provider_(provider) {}
+      : Presenter(host_gpu_loss_callback),
+        provider_(provider),
+        // The shared NGX core owner (Milestone 5-B, prerequisite P0-1). Created
+        // always (the constructor is trivial - no DLL load, no GPU work); the
+        // SDK Init happens only on the first Acquire (when SR or FG is
+        // requested). Shared by the DLSS SR backend and (Milestone 5-C) the
+        // DLSS FG backend; Shutdown1 runs only when the last consumer releases.
+        core_host_(std::make_unique<NgxCoreHost>()) {}
 
   bool dxgi_supports_tearing() const { return dxgi_supports_tearing_; }
 
@@ -359,6 +395,14 @@ class D3D12Presenter final : public Presenter {
   // drawers (accessible from the UI thread only, at any time).
   std::unique_ptr<D3D12GPUCompletionTimeline> ui_completion_timeline_;
 
+  // The shared NGX core owner (Milestone 5-B, prerequisite P0-1). Non-owning
+  // pointers to it are passed to the DLSS SR backend and (Milestone 5-C) the
+  // DLSS FG backend. The core host is the ONLY place that calls the NGX core
+  // lifecycle entry points (Init_with_ProjectID / Shutdown1 / AllocateParameters
+  // / DestroyParameters). Reference-counted; Shutdown1 runs only when the last
+  // consumer releases. Created in the constructor (trivial - no side effects).
+  std::unique_ptr<NgxCoreHost> core_host_;
+
   // Accessible only by painting and by surface connection lifetime management
   // (ConnectOrReconnectPaintingToSurfaceFromUIThread,
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
@@ -371,6 +415,18 @@ class D3D12Presenter final : public Presenter {
   // output (read-only). nullptr when SR has never been requested. The backend
   // never touches guest_output_resource_paint_refs.
   std::unique_ptr<IDLSSSuperSamplingBackend> dlss_sr_backend_;
+
+  // DLSS Frame Generation (FG) backend (Milestone 5-C). Lazily created when FG
+  // is requested (master && FG sub-switch). Owns its interpolated-output
+  // texture (N-0.5), OutputReal texture (N), disable-interpolation status
+  // buffer, and zero depth / motion-vector placeholders (guest resolution, read
+  // from frame_params.render_width/height); only borrows the backbuffer
+  // (read-only). nullptr when FG has never been requested. The backend never
+  // touches guest_output_resource_paint_refs.
+  std::unique_ptr<IFrameGenerationBackend> fg_backend_;
+  // Monotonically increasing FG real-frame ID (the ID of the real guest frame N
+  // being processed). Incremented on every processed guest frame.
+  uint64_t fg_frame_counter_ = 0;
 
   // NVOF optical-flow backend (Milestone 4-E). Produces a full-resolution
   // motion vector (R16G16_FLOAT, current -> previous) that the SR backend

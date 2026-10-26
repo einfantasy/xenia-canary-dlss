@@ -8,7 +8,10 @@ xe_shader_rules_dxbc(xenia-ui-d3d12 ${CMAKE_CURRENT_SOURCE_DIR}/../shaders)
 # includes the backend header and lazily creates the backend to produce the
 # motion vectors the SR backend borrows. It is an independent module (license
 # isolation, orthogonal to xenia-dlss).
-target_link_libraries(xenia-ui-d3d12 PUBLIC xenia-base xenia-ui xenia-dlss xenia-nvof)
+# xenia-fg is the DLSS Frame Generation (FG / DLSSG) backend (Milestone 5-C).
+# The presenter includes the backend header and lazily creates the backend.
+# Independent module (license isolation, orthogonal to xenia-dlss / xenia-nvof).
+target_link_libraries(xenia-ui-d3d12 PUBLIC xenia-base xenia-ui xenia-dlss xenia-nvof xenia-fg)
 xe_target_defaults(xenia-ui-d3d12)
 
 if(XENIA_BUILD_MISC)

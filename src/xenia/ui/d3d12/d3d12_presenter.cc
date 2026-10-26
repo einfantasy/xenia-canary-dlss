@@ -20,7 +20,8 @@
 #include "xenia/base/math.h"
 #include "xenia/ui/d3d12/d3d12_provider.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
-#include "xenia/ui/nvof/nvof_optical_flow_backend.h"
+#include "xenia/ui/dlss/fg/fg_frame_generation_backend.h"
+#include "xenia/ui/dlss/nvof/nvof_optical_flow_backend.h"
 #include "xenia/ui/surface_win.h"
 
 DEFINE_bool(
@@ -68,6 +69,13 @@ D3D12Presenter::~D3D12Presenter() {
   if (nvof_backend_) {
     nvof_backend_->Shutdown();
     nvof_backend_.reset();
+  }
+  // Shut down the FG backend before the SR backend (the FG backend releases its
+  // shared NGX core reference; the core host runs Shutdown1 only when the LAST
+  // consumer releases, which is the SR backend - so the order is FG -> SR).
+  if (fg_backend_) {
+    fg_backend_->Shutdown();
+    fg_backend_.reset();
   }
   dlss_sr_backend_.reset();
 }
@@ -581,6 +589,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
   bool back_buffer_acquired = false;
   bool back_buffer_bound = false;
   bool back_buffer_clear_needed = true;
+  // True when the FG block (Milestone 5-C) produced usable output this frame
+  // (the backend succeeded and the interp->backbuffer blit was recorded into
+  // fg_command_list). The present section uses this to decide between the 2x
+  // present (interp + real frame) and the original single present.
+  bool fg_block_used = false;
   constexpr float kBackBufferClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
 
   // Draw the guest output.
@@ -814,6 +827,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
       // the command list. On success the first paint effect reads the backend
       // output; on failure the command list is reset and the original path is
       // re-recorded by the effect loop below.
+      // The NVOF motion vectors (Milestone 4-E). Set by the NVOF block below
+      // (when OF produced a valid flow), read by the SR block (as
+      // pInMotionVectors) and (Milestone 5-C) by the FG block (as pMVecs).
+      // Null when NVOF is off or produced no valid flow (the backend uses its
+      // internal zero placeholder). Hoisted above the SR/NVOF block so the FG
+      // block (after the effect chain) can read it.
+      ID3D12Resource* mv_for_sr = nullptr;
       {
         GuestOutputEnhancementConfig enhancement_config;
         {
@@ -832,8 +852,6 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
             enhancement_config.IsSuperSamplingRequested() && !is_one_to_one;
         const bool of_requested =
             enhancement_config.IsOpticalFlowRequested() && !is_one_to_one;
-
-        ID3D12Resource* mv_for_sr = nullptr;
 
         // --- NVOF block (of_requested only; default off). ---
         // The NVOF backend produces a full-resolution motion vector (MV)
@@ -882,8 +900,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
             if (!dlss_sr_backend_) {
               dlss_sr_backend_ =
                   std::make_unique<xe::ui::dlss::DLSSSuperSamplingBackend>(
-                  device, GetDLSSRuntimeDirectories(), GetDLSSConfigPath(),
-                  enhancement_config.perf_quality);
+                      device, GetDLSSRuntimeDirectories(),
+                      GetDLSSConfigPath(), core_host_.get(),
+                      enhancement_config.perf_quality);
             }
             DlssSrFrameParams frame_params{};  // jitter 0, no reset (M3-B).
             Presenter::GuestOutputPaintFlow fallback_flow;
@@ -1216,6 +1235,213 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
             command_list->ResourceBarrier(barrier_count, barriers);
           }
         }
+
+        // --- FG block (fg_requested only; default off, Milestone 5-C). ---
+        // The DLSS FG backend reads the guest output resource (the real frame
+        // N at guest/render resolution, the same input the DLSS SR backend
+        // uses) and
+        // generates an interpolated frame (N-0.5) plus a copy of the real frame
+        // (OutputReal). It records its GPU commands (barriers + EvaluateFeature)
+        // into a SEPARATE command list (fg_command_list) so that an FG GPU-side
+        // failure discards only the FG commands, leaving the effect chain (in
+        // command_list) intact. The presenter also records the
+        // interp->backbuffer blit (paints N-0.5 into the back buffer) and the
+        // final RTV->PRESENT barrier into fg_command_list. On success the
+        // presenter presents the interpolated frame then the real frame (2x
+        // present). On failure (or when FG is off) the original single-present
+        // path is used (the effect chain already painted the real frame N into
+        // the back buffer).
+        {
+          GuestOutputEnhancementConfig enhancement_config;
+          {
+            std::lock_guard<std::mutex> lock(
+                guest_output_enhancement_config_mutex_);
+            enhancement_config = guest_output_enhancement_config_;
+          }
+          const uint32_t guest_width =
+              guest_output_properties.frontbuffer_width;
+          const uint32_t guest_height =
+              guest_output_properties.frontbuffer_height;
+          const bool is_one_to_one =
+              guest_width == paint_context_.swap_chain_width &&
+              guest_height == paint_context_.swap_chain_height;
+          const bool fg_requested =
+              enhancement_config.IsFrameGenerationRequested() && !is_one_to_one;
+          bool fg_used = false;
+          if (fg_requested) {
+            // Lazily create the backend (only when FG is requested and not 1:1
+            // bypassed). When the master switch is off this is never reached, so
+            // no backend is created, no DLL is loaded, and no GPU work is done.
+            if (!fg_backend_) {
+              fg_backend_ = std::make_unique<
+                  xe::ui::fg::FGFrameGenerationBackend>(
+                  device, GetDLSSRuntimeDirectories(), GetDLSSConfigPath(),
+                  core_host_.get());
+            }
+            // Reset the FG command list before recording the FG commands. Use
+            // the FG command allocator for the current paint submission (the
+            // ring ensures the previous frame's in-flight FG commands are not
+            // discarded).
+            ID3D12CommandAllocator* fg_command_allocator =
+                paint_context_
+                    .fg_command_allocators[current_paint_submission %
+                                           PaintContext::kSwapChainBufferCount]
+                    .Get();
+            fg_command_allocator->Reset();
+            paint_context_.fg_command_list->Reset(fg_command_allocator,
+                                                  nullptr);
+            DlssFgFrameParams frame_params{};
+            frame_params.frame_id = fg_frame_counter_;
+            frame_params.render_width = guest_width;
+            frame_params.render_height = guest_height;
+            // The FG input is the same resource the paint path reads as its first
+            // effect's source: the DLSS SR backend's output (display resolution)
+            // when SR is on, or the guest output resource (guest resolution) when
+            // SR is off. This keeps the interpolated frame consistent with the real
+            // frame (both derived from the SR-enhanced output when SR is on). The
+            // backend reads the input color size from this texture's descriptor, so
+            // its creation size auto-matches (display with SR, guest without).
+            ID3D12Resource* fg_input =
+                dlss_sr_used ? dlss_sr_backend_->OutputResource()
+                             : guest_output_resource.Get();
+            // Depth is always nullptr (Xbox 360 has no real depth; the backend
+            // uses its internal zero placeholder). Mvecs come from NVOF (if it
+            // produced a valid flow), otherwise nullptr (zero placeholder).
+            BackendResult fg_result = fg_backend_->TryProcess(
+                paint_context_.fg_command_list.Get(), fg_input,
+                /*depth=*/nullptr, mv_for_sr, frame_params);
+            if (fg_result == BackendResult::kSuccess) {
+              fg_used = true;
+              // Create the SRVs of the backend outputs in the view heap (CPU).
+              // The backend owns the output textures; we only create views for
+              // the FG paint pass to read.
+              ID3D12Resource* backend_interp = fg_backend_->OutputResource();
+              D3D12_SHADER_RESOURCE_VIEW_DESC interp_srv_desc;
+              interp_srv_desc.Format = kGuestOutputFormat;
+              interp_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+              interp_srv_desc.Shader4ComponentMapping =
+                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+              interp_srv_desc.Texture2D.MostDetailedMip = 0;
+              interp_srv_desc.Texture2D.MipLevels = 1;
+              interp_srv_desc.Texture2D.PlaneSlice = 0;
+              interp_srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+              device->CreateShaderResourceView(
+                  backend_interp, &interp_srv_desc,
+                  provider_.OffsetViewDescriptor(
+                      view_heap_cpu_start,
+                      PaintContext::kViewIndexDLSSFgOutputSrv));
+              ID3D12Resource* backend_real = fg_backend_->OutputRealResource();
+              D3D12_SHADER_RESOURCE_VIEW_DESC real_srv_desc;
+              real_srv_desc.Format = kGuestOutputFormat;
+              real_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+              real_srv_desc.Shader4ComponentMapping =
+                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+              real_srv_desc.Texture2D.MostDetailedMip = 0;
+              real_srv_desc.Texture2D.MipLevels = 1;
+              real_srv_desc.Texture2D.PlaneSlice = 0;
+              real_srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+              device->CreateShaderResourceView(
+                  backend_real, &real_srv_desc,
+                  provider_.OffsetViewDescriptor(
+                      view_heap_cpu_start,
+                      PaintContext::kViewIndexDLSSFgOutputRealSrv));
+              // Record the interp->backbuffer blit (paints N-0.5 into the back
+              // buffer) into the FG command list. The back buffer is still in
+              // RTV state (the effect chain painted the real frame N into it
+              // and it was never transitioned away - the FG input is now the
+              // guest output resource, not the back buffer), so blit the
+              // interpolated frame into it. The interp frame is at guest
+              // (render) resolution, so the bilinear paint effect upscales it
+              // to the display-resolution backbuffer (the same upscale the SR
+              // path performs).
+              paint_context_.fg_command_list->OMSetRenderTargets(
+                  1, &back_buffer_rtv, true, nullptr);
+              D3D12_VIEWPORT fg_viewport;
+              fg_viewport.TopLeftX = 0.0f;
+              fg_viewport.TopLeftY = 0.0f;
+              fg_viewport.Width = float(paint_context_.swap_chain_width);
+              fg_viewport.Height = float(paint_context_.swap_chain_height);
+              fg_viewport.MinDepth = 0.0f;
+              fg_viewport.MaxDepth = 1.0f;
+              paint_context_.fg_command_list->RSSetViewports(1, &fg_viewport);
+              D3D12_RECT fg_scissor;
+              fg_scissor.left = 0;
+              fg_scissor.top = 0;
+              fg_scissor.right = LONG(paint_context_.swap_chain_width);
+              fg_scissor.bottom = LONG(paint_context_.swap_chain_height);
+              paint_context_.fg_command_list->RSSetScissorRects(1, &fg_scissor);
+              paint_context_.fg_command_list->SetPipelineState(
+                  guest_output_paint_final_pipelines_
+                      [size_t(GuestOutputPaintEffect::kBilinear)].Get());
+              paint_context_.fg_command_list->SetGraphicsRootSignature(
+                  guest_output_paint_root_signatures_
+                      [size_t(kGuestOutputPaintRootSignatureIndexBilinear)]
+                          .Get());
+              paint_context_.fg_command_list->SetDescriptorHeaps(1, &view_heap);
+              paint_context_.fg_command_list->SetGraphicsRootDescriptorTable(
+                  UINT(GuestOutputPaintRootParameter::kSource),
+                  provider_.OffsetViewDescriptor(
+                      view_heap_gpu_start,
+                      PaintContext::kViewIndexDLSSFgOutputSrv));
+              // Full-screen rectangle (NDC). The interp frame is at guest
+              // resolution; the bilinear effect stretches it to fill the
+              // display-resolution backbuffer.
+              GuestOutputPaintRectangleConstants fg_rect_constants;
+              fg_rect_constants.x = -1.0f;
+              fg_rect_constants.y = 1.0f;
+              fg_rect_constants.width = 2.0f;
+              fg_rect_constants.height = -2.0f;
+              paint_context_.fg_command_list->SetGraphicsRoot32BitConstants(
+                  UINT(GuestOutputPaintRootParameter::kRectangle),
+                  sizeof(fg_rect_constants) / sizeof(uint32_t),
+                  &fg_rect_constants, 0);
+              BilinearConstants fg_bilinear_constants;
+              fg_bilinear_constants.output_offset[0] = 0;
+              fg_bilinear_constants.output_offset[1] = 0;
+              fg_bilinear_constants.output_size_inv[0] =
+                  1.0f / float(paint_context_.swap_chain_width);
+              fg_bilinear_constants.output_size_inv[1] =
+                  1.0f / float(paint_context_.swap_chain_height);
+              paint_context_.fg_command_list->SetGraphicsRoot32BitConstants(
+                  UINT(GuestOutputPaintRootParameter::kEffectConstants),
+                  sizeof(fg_bilinear_constants) / sizeof(uint32_t),
+                  &fg_bilinear_constants, 0);
+              paint_context_.fg_command_list->IASetPrimitiveTopology(
+                  D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+              paint_context_.fg_command_list->DrawInstanced(4, 1, 0, 0);
+              // Transition the back buffer to PRESENT (the FG list is executed
+              // last, so the final barrier must be here, not in command_list).
+              D3D12_RESOURCE_BARRIER fg_barrier_rtv_to_present;
+              fg_barrier_rtv_to_present.Type =
+                  D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+              fg_barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+              fg_barrier_rtv_to_present.Transition.pResource = back_buffer;
+              fg_barrier_rtv_to_present.Transition.Subresource =
+                  D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+              fg_barrier_rtv_to_present.Transition.StateBefore =
+                  D3D12_RESOURCE_STATE_RENDER_TARGET;
+              fg_barrier_rtv_to_present.Transition.StateAfter =
+                  D3D12_RESOURCE_STATE_PRESENT;
+              paint_context_.fg_command_list->ResourceBarrier(
+                  1, &fg_barrier_rtv_to_present);
+            } else {
+              // FG failure: reset the FG command list to discard the recorded
+              // FG commands. The effect chain (in command_list) already painted
+              // the real frame N into the back buffer, so the original
+              // single-present path is used (no 2x present). Never marked as
+              // success.
+              XELOGW("DLSS FG: TryProcess returned {}; falling back to the "
+                     "original single-present path this frame.",
+                     BackendResultToString(fg_result));
+              fg_command_allocator->Reset();
+              paint_context_.fg_command_list->Reset(fg_command_allocator,
+                                                    nullptr);
+            }
+            ++fg_frame_counter_;
+          }
+          // Expose the FG state to the present section below.
+          fg_block_used = fg_used;
+        }
       }
     }
   }
@@ -1277,52 +1503,210 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
     ExecuteUIDrawersFromUIThread(ui_draw_context);
   }
 
-  // End drawing to the back buffer.
-  D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
-  barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-  barrier_rtv_to_present.Transition.pResource = back_buffer;
-  barrier_rtv_to_present.Transition.Subresource =
-      D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  barrier_rtv_to_present.Transition.StateBefore =
-      D3D12_RESOURCE_STATE_RENDER_TARGET;
-  barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-  command_list->ResourceBarrier(1, &barrier_rtv_to_present);
-
   // Execute and present.
   // TODO(Triang3l): Error checking.
-  command_list->Close();
   ID3D12CommandQueue* const direct_queue = provider_.GetDirectQueue();
-  ID3D12CommandList* execute_command_list = command_list;
-  direct_queue->ExecuteCommandLists(1, &execute_command_list);
-  if (execute_ui_drawers) {
-    ui_completion_timeline_->SignalAndAdvance(direct_queue);
-  }
-  paint_context_.paint_completion_timeline->SignalAndAdvance(direct_queue);
-  // Present as soon as possible, without waiting for vsync (the host refresh
-  // rate may be something like 144 Hz, which is not a multiple of the common
-  // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
-  // frames for lower latency. Also, if possible, allowing tearing to use
-  // variable refresh rate in borderless fullscreen (note that if DXGI
-  // fullscreen is ever used in, the allow tearing flag must not be passed in
-  // fullscreen, but DXGI fullscreen is largely unneeded with the flip
-  // presentation model used in Direct3D 12).
-  HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
-                                     ? DXGI_PRESENT_ALLOW_TEARING
-                                     : 0));
-  // Even if presentation has failed, work might have been enqueued anyway
-  // internally before the failure according to Jesse Natalie from the DirectX
-  // Discord server.
-  paint_context_.present_completion_timeline->SignalAndAdvance(direct_queue);
-  switch (present_result) {
-    case DXGI_ERROR_DEVICE_REMOVED:
-      return PaintResult::kGpuLostExternally;
-    case DXGI_ERROR_DEVICE_RESET:
-      return PaintResult::kGpuLostResponsible;
-    default:
-      return SUCCEEDED(present_result) ? PaintResult::kPresented
-                                       : PaintResult::kNotPresented;
+  if (fg_block_used) {
+    // --- 2x present path (Milestone 5-C). ---
+    // The effect chain (the real frame N) is in command_list; the FG block
+    // (the FG Evaluate + the interp->backbuffer blit + the RTV->PRESENT
+    // barrier) is in fg_command_list. Execute the main list first (painting
+    // the real frame N into the back buffer), then the FG list (the FG
+    // Evaluate reads N, generates the interpolated frame N-0.5, and blits it
+    // into the back buffer). After both, the back buffer holds N-0.5 in
+    // PRESENT state. Present it. Then re-record the OutputReal->backbuffer
+    // blit (the real frame N) into command_list (Reset, after awaiting the
+    // effect chain to complete on the GPU), execute it, and present the real
+    // frame N. The swap chain advances one back buffer per Present, so the
+    // second present targets the next back buffer (re-acquired below).
+    command_list->Close();
+    paint_context_.fg_command_list->Close();
+    ID3D12CommandList* execute_lists[2] = {
+        command_list, paint_context_.fg_command_list.Get()};
+    direct_queue->ExecuteCommandLists(2, execute_lists);
+    if (execute_ui_drawers) {
+      ui_completion_timeline_->SignalAndAdvance(direct_queue);
+    }
+    paint_context_.paint_completion_timeline->SignalAndAdvance(direct_queue);
+    // Present as soon as possible (see the comment below the single-present
+    // path for the rationale of the flags).
+    HRESULT present_result = paint_context_.swap_chain->Present(
+        0, DXGI_PRESENT_RESTART |
+               (paint_context_.swap_chain_allows_tearing
+                    ? DXGI_PRESENT_ALLOW_TEARING
+                    : 0));
+    paint_context_.present_completion_timeline->SignalAndAdvance(direct_queue);
+    switch (present_result) {
+      case DXGI_ERROR_DEVICE_REMOVED:
+        return PaintResult::kGpuLostExternally;
+      case DXGI_ERROR_DEVICE_RESET:
+        return PaintResult::kGpuLostResponsible;
+      default:
+        break;
+    }
+    if (!SUCCEEDED(present_result)) {
+      return PaintResult::kNotPresented;
+    }
+    // Await the GPU to finish the effect chain before re-recording into
+    // command_list (Resetting the main command allocator). The
+    // paint_completion_timeline was just signaled, so this is fast.
+    paint_context_.paint_completion_timeline->AwaitSubmissionAndUpdateCompleted(
+        paint_context_.paint_completion_timeline->GetUpcomingSubmission() - 1);
+    // Re-acquire the next back buffer (the swap chain advanced after the first
+    // Present) and its RTV.
+    UINT next_back_buffer_index =
+        paint_context_.swap_chain->GetCurrentBackBufferIndex();
+    D3D12_CPU_DESCRIPTOR_HANDLE next_back_buffer_rtv =
+        provider_.OffsetRTVDescriptor(
+            rtv_heap_start,
+            PaintContext::kRTVIndexSwapChainBuffer0 + next_back_buffer_index);
+    ID3D12Resource* next_back_buffer =
+        paint_context_.swap_chain_buffers[next_back_buffer_index].Get();
+    // Re-record the OutputReal->backbuffer blit (the real frame N) into
+    // command_list.
+    command_allocator->Reset();
+    command_list->Reset(command_allocator, nullptr);
+    D3D12_RESOURCE_BARRIER second_barrier_present_to_rtv;
+    second_barrier_present_to_rtv.Type =
+        D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    second_barrier_present_to_rtv.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    second_barrier_present_to_rtv.Transition.pResource = next_back_buffer;
+    second_barrier_present_to_rtv.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    second_barrier_present_to_rtv.Transition.StateBefore =
+        D3D12_RESOURCE_STATE_PRESENT;
+    second_barrier_present_to_rtv.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_RENDER_TARGET;
+    command_list->ResourceBarrier(1, &second_barrier_present_to_rtv);
+    command_list->OMSetRenderTargets(1, &next_back_buffer_rtv, true, nullptr);
+    D3D12_VIEWPORT second_viewport;
+    second_viewport.TopLeftX = 0.0f;
+    second_viewport.TopLeftY = 0.0f;
+    second_viewport.Width = float(paint_context_.swap_chain_width);
+    second_viewport.Height = float(paint_context_.swap_chain_height);
+    second_viewport.MinDepth = 0.0f;
+    second_viewport.MaxDepth = 1.0f;
+    command_list->RSSetViewports(1, &second_viewport);
+    D3D12_RECT second_scissor;
+    second_scissor.left = 0;
+    second_scissor.top = 0;
+    second_scissor.right = LONG(paint_context_.swap_chain_width);
+    second_scissor.bottom = LONG(paint_context_.swap_chain_height);
+    command_list->RSSetScissorRects(1, &second_scissor);
+    command_list->SetPipelineState(
+        guest_output_paint_final_pipelines_
+            [size_t(GuestOutputPaintEffect::kBilinear)].Get());
+    command_list->SetGraphicsRootSignature(
+        guest_output_paint_root_signatures_
+            [size_t(kGuestOutputPaintRootSignatureIndexBilinear)]
+                .Get());
+    ID3D12DescriptorHeap* view_heap = paint_context_.view_heap.Get();
+    D3D12_GPU_DESCRIPTOR_HANDLE view_heap_gpu_start =
+        view_heap->GetGPUDescriptorHandleForHeapStart();
+    command_list->SetDescriptorHeaps(1, &view_heap);
+    command_list->SetGraphicsRootDescriptorTable(
+        UINT(GuestOutputPaintRootParameter::kSource),
+        provider_.OffsetViewDescriptor(
+            view_heap_gpu_start, PaintContext::kViewIndexDLSSFgOutputRealSrv));
+    GuestOutputPaintRectangleConstants second_rect_constants;
+    second_rect_constants.x = -1.0f;
+    second_rect_constants.y = 1.0f;
+    second_rect_constants.width = 2.0f;
+    second_rect_constants.height = -2.0f;
+    command_list->SetGraphicsRoot32BitConstants(
+        UINT(GuestOutputPaintRootParameter::kRectangle),
+        sizeof(second_rect_constants) / sizeof(uint32_t),
+        &second_rect_constants, 0);
+    BilinearConstants second_bilinear_constants;
+    second_bilinear_constants.output_offset[0] = 0;
+    second_bilinear_constants.output_offset[1] = 0;
+    second_bilinear_constants.output_size_inv[0] =
+        1.0f / float(paint_context_.swap_chain_width);
+    second_bilinear_constants.output_size_inv[1] =
+        1.0f / float(paint_context_.swap_chain_height);
+    command_list->SetGraphicsRoot32BitConstants(
+        UINT(GuestOutputPaintRootParameter::kEffectConstants),
+        sizeof(second_bilinear_constants) / sizeof(uint32_t),
+        &second_bilinear_constants, 0);
+    command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    command_list->DrawInstanced(4, 1, 0, 0);
+    D3D12_RESOURCE_BARRIER second_barrier_rtv_to_present;
+    second_barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    second_barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    second_barrier_rtv_to_present.Transition.pResource = next_back_buffer;
+    second_barrier_rtv_to_present.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    second_barrier_rtv_to_present.Transition.StateBefore =
+        D3D12_RESOURCE_STATE_RENDER_TARGET;
+    second_barrier_rtv_to_present.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_PRESENT;
+    command_list->ResourceBarrier(1, &second_barrier_rtv_to_present);
+    command_list->Close();
+    ID3D12CommandList* execute_second = command_list;
+    direct_queue->ExecuteCommandLists(1, &execute_second);
+    // Present the real frame (N).
+    present_result = paint_context_.swap_chain->Present(
+        0, DXGI_PRESENT_RESTART |
+               (paint_context_.swap_chain_allows_tearing
+                    ? DXGI_PRESENT_ALLOW_TEARING
+                    : 0));
+    paint_context_.present_completion_timeline->SignalAndAdvance(direct_queue);
+    switch (present_result) {
+      case DXGI_ERROR_DEVICE_REMOVED:
+        return PaintResult::kGpuLostExternally;
+      case DXGI_ERROR_DEVICE_RESET:
+        return PaintResult::kGpuLostResponsible;
+      default:
+        return SUCCEEDED(present_result) ? PaintResult::kPresented
+                                         : PaintResult::kNotPresented;
+    }
+  } else {
+    // --- Original single-present path. ---
+    // The effect chain (or the back-buffer clear) has painted the back buffer
+    // (the real frame N, or a cleared frame). Record the RTV->PRESENT barrier
+    // into command_list, execute, and present.
+    D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
+    barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier_rtv_to_present.Transition.pResource = back_buffer;
+    barrier_rtv_to_present.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier_rtv_to_present.Transition.StateBefore =
+        D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    command_list->ResourceBarrier(1, &barrier_rtv_to_present);
+    command_list->Close();
+    ID3D12CommandList* execute_command_list = command_list;
+    direct_queue->ExecuteCommandLists(1, &execute_command_list);
+    if (execute_ui_drawers) {
+      ui_completion_timeline_->SignalAndAdvance(direct_queue);
+    }
+    paint_context_.paint_completion_timeline->SignalAndAdvance(direct_queue);
+    // Present as soon as possible, without waiting for vsync (the host refresh
+    // rate may be something like 144 Hz, which is not a multiple of the common
+    // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
+    // frames for lower latency. Also, if possible, allowing tearing to use
+    // variable refresh rate in borderless fullscreen (note that if DXGI
+    // fullscreen is ever used in, the allow tearing flag must not be passed in
+    // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+    // presentation model used in Direct3D 12).
+    HRESULT present_result = paint_context_.swap_chain->Present(
+        0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
+                                       ? DXGI_PRESENT_ALLOW_TEARING
+                                       : 0));
+    // Even if presentation has failed, work might have been enqueued anyway
+    // internally before the failure according to Jesse Natalie from the DirectX
+    // Discord server.
+    paint_context_.present_completion_timeline->SignalAndAdvance(direct_queue);
+    switch (present_result) {
+      case DXGI_ERROR_DEVICE_REMOVED:
+        return PaintResult::kGpuLostExternally;
+      case DXGI_ERROR_DEVICE_RESET:
+        return PaintResult::kGpuLostResponsible;
+      default:
+        return SUCCEEDED(present_result) ? PaintResult::kPresented
+                                         : PaintResult::kNotPresented;
+    }
   }
 }
 
@@ -1660,6 +2044,33 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
   }
   // Command lists are created in an open state.
   paint_context_.command_list->Close();
+
+  // FG command allocator and command list (Milestone 5-C). Recorded into this
+  // separate command list (NOT the main command_list) so that an FG GPU-side
+  // failure discards only the FG commands, leaving the effect chain (in
+  // command_list) intact. Created in an open state, like command_list; it is
+  // Reset every frame (in the FG block) before recording the FG commands.
+  // A ring of command allocators (one per in-flight frame), like
+  // command_allocators, so the fg_command_list can be Reset every frame
+  // without discarding the previous frame's in-flight FG commands.
+  for (Microsoft::WRL::ComPtr<ID3D12CommandAllocator>&
+           fg_command_allocator_ref : paint_context_.fg_command_allocators) {
+    if (FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&fg_command_allocator_ref)))) {
+      XELOGE("D3D12Presenter: Failed to create an FG command allocator");
+      return false;
+    }
+  }
+  if (FAILED(device->CreateCommandList(
+          0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+          paint_context_.fg_command_allocators[0].Get(), nullptr,
+          IID_PPV_ARGS(&paint_context_.fg_command_list)))) {
+    XELOGE("D3D12Presenter: Failed to create the FG command list");
+    return false;
+  }
+  // Command lists are created in an open state.
+  paint_context_.fg_command_list->Close();
 
   // RTV descriptor heap.
   D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc;

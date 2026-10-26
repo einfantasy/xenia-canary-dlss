@@ -377,6 +377,130 @@ class IOpticalFlowBackend {
 };
 
 // ---------------------------------------------------------------------------
+// DlssFgFrameParams
+//
+// Per-frame parameters for the DLSS Frame Generation (FG / DLSSG) backend.
+// These change per frame (the frame ID advances; reset is set on scene
+// changes; the motion-vector scale may vary) and are passed as call arguments
+// to the backend's per-frame call, NOT stored in a persistent config object.
+// (Mirrors DlssSrFrameParams.)
+//
+// The camera matrices and the remaining SDK opt-eval parameters are NOT
+// modeled here: Xbox 360 guest output carries no camera information, so the
+// backend feeds identity / zero values for them (documented, honest
+// fallback). Only the parameters that Xenia can actually vary per frame are
+// exposed.
+struct DlssFgFrameParams {
+  // Set to true on a scene change; resets the FG backend's temporal history.
+  bool in_reset = false;
+  // Monotonically increasing real-frame ID (the ID of the real guest frame N
+  // being processed; the interpolated frame N-0.5 is derived from it).
+  uint64_t frame_id = 0;
+  // True when depth values are inverted (value closer to the camera is
+  // higher). Xbox 360 guest depth is a zero placeholder, so this is false.
+  bool depth_inverted = false;
+  // Motion-vector scale (the NVOF MV output is already in pixel units, so the
+  // scale is 1.0). Exposed for completeness of the SDK contract.
+  float mvec_scale_x = 1.0f;
+  float mvec_scale_y = 1.0f;
+  // The guest output (render) size: the size of ALL of the backend's color
+  // resources - the real-frame INPUT texture (the guest output resource), the
+  // depth and motion-vector inputs (and of the backend's internal zero
+  // placeholders), AND the interpolated / real OUTPUT textures. The SDK's
+  // creation Width/Height (== InternalWidth/Height == RenderWidth/RenderHeight)
+  // and the backbuffer / outputInterp subrects all must describe this one size.
+  // The fixed TryProcess signature passes the guest output resource as the
+  // input, so the guest size is carried here (the presenter always knows it).
+  // The display (backbuffer) size is NOT carried here: the presenter upscales
+  // the guest-resolution outputs to the display backbuffer with its bilinear
+  // paint effect, so the backend never needs the display size.
+  uint32_t render_width = 0;
+  uint32_t render_height = 0;
+};
+
+// ---------------------------------------------------------------------------
+// IFrameGenerationBackend
+//
+// The minimal DLSS Frame Generation backend interface. A real implementation
+// (Milestone 5-C) will own its own interpolated-output texture, its
+// OutputReal texture (the SDK's copy of the real frame N), its disable-
+// interpolation status buffer, the SDK feature handle + parameter block, and
+// its zero-depth placeholder. It only borrows the backbuffer, depth, and
+// motion vectors (read-only) - it never takes ownership of them and never
+// takes over guest_output_resource_paint_refs.
+//
+// In Milestone 5-B this interface is defined but NOT implemented with a real
+// SDK instance: the backend in fg/* is a stub that returns a configurable
+// BackendResult so the path-selection and ownership logic can be tested
+// host-side (no GPU). The stub performs no real GPU work and must never be
+// interpreted as a real Frame Generation execution. Real SDK calls are
+// deferred to Milestone 5-C.
+class IFrameGenerationBackend {
+ public:
+  virtual ~IFrameGenerationBackend() = default;
+
+  // Whether the backend is currently available (runtime present and capable).
+  virtual bool IsAvailable() const = 0;
+  // True when the first creation failed and the backend will not retry the SDK.
+  virtual bool IsUnavailable() const = 0;
+
+  // Attempt to process one frame. Records the FG Evaluate (and the surrounding
+  // state-transition barriers) into the caller's command list. Returns a
+  // BackendResult: kSuccess, or one of the specific failure reasons
+  // (kUnavailable, kInitFailed, kInputContractFailed, kSyncConditionFailed,
+  // kExecutionFailed, kOutputInvalid).
+  //
+  // `backbuffer` is the display-resolution color input (R10G10B10A2_UNORM):
+  // the DLSS SR output texture (when SR is on) or a display-resolution copy of
+  // the guest output (when SR is off). It is borrowed read-only. It must be
+  // non-null.
+  // `depth` is the guest-resolution depth (a zero placeholder for Xbox 360).
+  // It is borrowed read-only. It is OPTIONAL: when nullptr the backend uses its
+  // own internal zero-filled depth placeholder.
+  // `mvecs` is the guest-resolution motion vectors (R16G16_FLOAT, pixel units,
+  // current -> previous) produced by the NVOF backend. It is borrowed read-only.
+  // It is OPTIONAL: when nullptr the backend uses its own internal zero-filled
+  // motion-vector placeholder.
+  //
+  // The command list is a recording buffer; on failure the caller resets it
+  // (the backend does not reset it itself), mirroring the DLSS SR / NVOF
+  // backend contract.
+  virtual BackendResult TryProcess(
+      ID3D12GraphicsCommandList* command_list,
+      ID3D12Resource* backbuffer,
+      ID3D12Resource* depth,
+      ID3D12Resource* mvecs,
+      const DlssFgFrameParams& frame_params) = 0;
+
+  // The backend's owned zero-filled depth (guest resolution, R32_FLOAT, NPSR)
+  // and zero-filled motion-vector (guest resolution, R16G16_FLOAT, NPSR)
+  // placeholders, valid after a successful TryProcess (the backend created them
+  // during initialization). The presenter passes these (or nullptr) as the
+  // depth / mvecs arguments of TryProcess. The default implementations return
+  // nullptr so host-test stub backends need no overrides; the real FG backend
+  // overrides them.
+  virtual ID3D12Resource* ZeroDepthPlaceholder() const { return nullptr; }
+  virtual ID3D12Resource* ZeroMotionVectorPlaceholder() const {
+    return nullptr;
+  }
+
+  // The backend's owned interpolated-output texture (the generated frame
+  // N-0.5), valid after a successful TryProcess (the backend created it during
+  // initialization). The presenter uses these to create the SRV the paint pass
+  // reads from. The default implementations return nullptr/0 so host-test
+  // stub backends need no overrides; the real FG backend overrides them.
+  virtual ID3D12Resource* OutputResource() const { return nullptr; }
+  // The backend's owned OutputReal texture (the SDK's copy of the real frame N).
+  virtual ID3D12Resource* OutputRealResource() const { return nullptr; }
+  virtual uint32_t OutputWidth() const { return 0; }
+  virtual uint32_t OutputHeight() const { return 0; }
+
+  // Release backend-owned resources. The presenter never destroys backend
+  // resources directly; this is the backend's responsibility.
+  virtual void Shutdown() = 0;
+};
+
+// ---------------------------------------------------------------------------
 // BuildOriginalPathFallbackFlow
 //
 // Builds the original-path fallback flow: effect_count = 1 and effects[0] =

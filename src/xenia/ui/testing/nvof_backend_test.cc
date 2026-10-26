@@ -7,8 +7,8 @@
  ******************************************************************************
  */
 
-#include "xenia/ui/nvof/nvof_optical_flow_backend.h"
-#include "xenia/ui/nvof/nvof_test_components.h"
+#include "xenia/ui/dlss/nvof/nvof_optical_flow_backend.h"
+#include "xenia/ui/dlss/nvof/nvof_test_components.h"
 
 #include <windows.h>
 #include <d3d12.h>
