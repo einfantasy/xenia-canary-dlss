@@ -381,7 +381,7 @@ class IOpticalFlowBackend {
 //
 // Per-frame parameters for the DLSS Frame Generation (FG / DLSSG) backend.
 // These change per frame (the frame ID advances; reset is set on scene
-// changes; the motion-vector scale may vary) and are passed as call arguments
+// changes) and are passed as call arguments
 // to the backend's per-frame call, NOT stored in a persistent config object.
 // (Mirrors DlssSrFrameParams.)
 //
@@ -399,10 +399,6 @@ struct DlssFgFrameParams {
   // True when depth values are inverted (value closer to the camera is
   // higher). Xbox 360 guest depth is a zero placeholder, so this is false.
   bool depth_inverted = false;
-  // Motion-vector scale (the NVOF MV output is already in pixel units, so the
-  // scale is 1.0). Exposed for completeness of the SDK contract.
-  float mvec_scale_x = 1.0f;
-  float mvec_scale_y = 1.0f;
   // The guest output (render) size: the size of ALL of the backend's color
   // resources - the real-frame INPUT texture (the guest output resource), the
   // depth and motion-vector inputs (and of the backend's internal zero

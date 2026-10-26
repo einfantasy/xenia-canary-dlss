@@ -887,8 +887,18 @@ BackendResult FGFrameGenerationBackend::TryProcess(
   }
   opt_params.jitterOffset[0] = 0.0f;
   opt_params.jitterOffset[1] = 0.0f;
-  opt_params.mvecScale[0] = frame_params.mvec_scale_x;
-  opt_params.mvecScale[1] = frame_params.mvec_scale_y;
+  // Motion-vector scale (Stage 4): the SDK multiplies the raw MV buffer by
+  // mvecScale. Our densify output is in PIXEL units and points current ->
+  // previous (kNegate=0, verified by Veyra's +8px displacement test). DLSSG
+  // FG expects (current - previous) in NORMALIZED coordinates, so the scale
+  // is (-1/render_w, -1/render_h): divide by the MV buffer size (guest
+  // resolution, == render_width/render_height) to normalize, and negate to
+  // flip the direction from current->previous to previous->current. With the
+  // prior (1,1) scale the SDK read a 100-pixel displacement as a 100-screen
+  // normalized displacement in the wrong direction, smearing the
+  // interpolated frame.
+  opt_params.mvecScale[0] = -1.0f / static_cast<float>(render_width);
+  opt_params.mvecScale[1] = -1.0f / static_cast<float>(render_height);
   opt_params.cameraNear = 0.1f;
   opt_params.cameraFar = 1000.0f;
   opt_params.cameraFOV = 1.5707963f;  // pi/2
