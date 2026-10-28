@@ -43,17 +43,18 @@ namespace ui {
 // nvsdk_ngx_defs.h:251-260). The UI/config layer never includes any nvsdk_*
 // header (license isolation: SDK dependencies are confined to the dlss/*
 // module); the backend maps this value to the SDK enum at feature creation.
-// Two SDK values are intentionally absent:
-//   - UltraQuality (=4): not supported by the current DLSS runtime version;
-//     the UI does not expose it and the backend never sends it.
-//   - DLAA (=5): means input size == output size (1.0 scaling), which has no
-//     meaning for the guest output path.
+// All six SDK values are exposed. The two extended tiers (UltraQuality, DLAA)
+// may fail to initialize on a runtime that does not support them; the
+// backend then deterministically re-initializes with the Balanced tier
+// (logged), or falls back to the original path if that fails too.
 // ---------------------------------------------------------------------------
 enum class DlssSrPerfQuality : uint8_t {
   kMaxPerf = 0,
   kBalanced = 1,
   kMaxQuality = 2,
   kUltraPerformance = 3,
+  kUltraQuality = 4,
+  kDLAA = 5,
 };
 
 // ---------------------------------------------------------------------------

@@ -188,6 +188,34 @@ class DLSSSuperSamplingBackend final : public IDLSSSuperSamplingBackend {
   // triggers a re-create (release + re-create), just like a size change.
   ui::DlssSrPerfQuality created_perf_quality_;
 
+  // True when the current feature was created with the Balanced quality tier
+  // because the REQUESTED quality failed to initialize (the Balanced
+  // fallback). While this flag is set, a repeated TryProcess request for the
+  // same quality (fallback_from_quality_) must NOT trigger a re-create -
+  // otherwise the failed init + fallback would repeat every frame. Any other
+  // requested quality still triggers a re-create (with a fresh fallback
+  // attempt if it fails again). Reset by Shutdown.
+  bool quality_fallback_active_ = false;
+  // The requested quality that triggered the current Balanced fallback. Valid
+  // only while quality_fallback_active_ is true.
+  ui::DlssSrPerfQuality fallback_from_quality_ =
+      ui::DlssSrPerfQuality::kBalanced;
+  // One-shot pending Balanced fallback. Set when Initialize fails with a
+  // non-Balanced quality (and the failure is not a config/contract error);
+  // consumed by the NEXT TryProcess, which then initializes with the Balanced
+  // tier. The retry happens next frame (not this frame) because the failed
+  // Initialize has already recorded zero-init commands into the command list,
+  // which the presenter discards (it resets the command list on a backend
+  // failure) - so the fallback Initialize records into a fresh command list.
+  // If the requested quality changes before the pending retry runs, the
+  // pending fallback is discarded (a fresh attempt at the new quality is
+  // made). Reset by Shutdown.
+  bool balanced_fallback_pending_ = false;
+  // The requested quality that the pending fallback applies to. Valid only
+  // while balanced_fallback_pending_ is true.
+  ui::DlssSrPerfQuality balanced_fallback_quality_ =
+      ui::DlssSrPerfQuality::kBalanced;
+
     // The render preset the current feature was created with. Initialized to
     // kDefault (the constructor does not take a render preset; the first
     // TryProcess always initializes, so this value is only ever compared AFTER
@@ -227,7 +255,7 @@ class DLSSSuperSamplingBackend final : public IDLSSSuperSamplingBackend {
   bool output_in_pixel_shader_resource_ = false;
 
   // True after the first input-contract failure has been logged. The early
-  // contract checks (null pointer / zero size / 1:1) fire every frame, so the
+  // contract checks (null pointer / zero size) fire every frame, so the
   // failure is logged only once to avoid per-frame spam. Diagnostic only -
   // the presenter separately logs the fallback this frame.
   bool contract_failure_logged_ = false;

@@ -409,8 +409,7 @@ class D3D12Presenter final : public Presenter {
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
 
-  // DLSS SR backend (Milestone 3-B). Lazily created when SR is requested and
-  // the guest output is not already at the target resolution (1:1 bypass).
+  // DLSS SR backend (Milestone 3-B). Lazily created when SR is requested.
   // Owns its output texture and the SDK feature handle; only borrows the guest
   // output (read-only). nullptr when SR has never been requested. The backend
   // never touches guest_output_resource_paint_refs.

@@ -828,8 +828,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
       }
 
       // Try the DLSS SR backend (Milestone 3-B). Reached only when the guest
-      // output has a paint flow, SR is requested (master && SR sub-switch), and
-      // the guest output is not already at the target resolution (1:1 bypass).
+      // output has a paint flow and SR is requested (master && SR sub-switch).
+      // There is no 1:1 bypass: when the guest output is already at the target
+      // resolution the backend still runs (SR in its requested quality tier -
+      // e.g. DLAA for a 1:1 resolution).
       // The backend records its GPU commands (barriers + EvaluateFeature) into
       // the command list. On success the first paint effect reads the backend
       // output; on failure the command list is reset and the original path is
@@ -852,13 +854,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
             guest_output_properties.frontbuffer_width;
         const uint32_t guest_height =
             guest_output_properties.frontbuffer_height;
-        const bool is_one_to_one =
-            guest_width == paint_context_.swap_chain_width &&
-            guest_height == paint_context_.swap_chain_height;
         const bool sr_requested =
-            enhancement_config.IsSuperSamplingRequested() && !is_one_to_one;
+            enhancement_config.IsSuperSamplingRequested();
         const bool of_requested =
-            enhancement_config.IsOpticalFlowRequested() && !is_one_to_one;
+            enhancement_config.IsOpticalFlowRequested();
 
         // --- NVOF block (of_requested only; default off). ---
         // The NVOF backend produces a full-resolution motion vector (MV)
@@ -866,7 +865,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
         // pInMotionVectors (mv_for_sr). NVOF and SR are orthogonal: an NVOF
         // failure (or the first frame) leaves mv_for_sr null, so SR uses its
         // internal zero placeholder MV. Lazily create the backend (only when
-        // OF is requested and not 1:1 bypassed). When the master switch is off
+        // OF is requested). When the master switch is off
         // this is never reached, so no backend is created, no DLL is loaded,
         // and no GPU work is done.
         if (of_requested) {
@@ -893,8 +892,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
 
         // --- SR block (sr_requested only; existing). ---
         if (sr_requested) {
-            // Lazily create the backend (only when SR is actually requested and
-            // not bypassed). When the master switch is off this is never
+            // Lazily create the backend (only when SR is actually requested).
+            // When the master switch is off this is never
             // reached, so no backend is created, no DLL is loaded, and no GPU
             // work is done.
               // The quality preset AND the render preset are create-time
@@ -1269,15 +1268,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
               guest_output_properties.frontbuffer_width;
           const uint32_t guest_height =
               guest_output_properties.frontbuffer_height;
-          const bool is_one_to_one =
-              guest_width == paint_context_.swap_chain_width &&
-              guest_height == paint_context_.swap_chain_height;
+          // No 1:1 bypass: FG interpolates at the input (guest) resolution,
+          // which is also the render size; when the guest output is already
+          // at the target resolution the two are identical and the backend
+          // runs as usual.
           const bool fg_requested =
-              enhancement_config.IsFrameGenerationRequested() && !is_one_to_one;
+              enhancement_config.IsFrameGenerationRequested();
           bool fg_used = false;
           if (fg_requested) {
-            // Lazily create the backend (only when FG is requested and not 1:1
-            // bypassed). When the master switch is off this is never reached, so
+            // Lazily create the backend (only when FG is requested). When the
+            // master switch is off this is never reached, so
             // no backend is created, no DLL is loaded, and no GPU work is done.
             if (!fg_backend_) {
               fg_backend_ = std::make_unique<

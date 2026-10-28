@@ -346,5 +346,61 @@ TEST_CASE("Other sub-features off do not affect SR", "[enhancement]") {
     CHECK(default_backend.last_render_preset_ == DlssSrRenderPreset::kDefault);
   }
 
+  // 19. The Xenia-side quality enum mirrors the SDK's NVSDK_NGX_PerfQuality_Value
+  // (nvsdk_ngx_defs.h: the six quality tiers, contiguous 0..5). The UI layer
+  // never includes the SDK header, so these static_asserts are the only place
+  // that pins the values (license isolation).
+  TEST_CASE("Quality preset enum values", "[enhancement]") {
+    GuestOutputEnhancementConfig config;
+    // The default is still kBalanced (behavior-neutral).
+    CHECK(config.perf_quality == DlssSrPerfQuality::kBalanced);
+    static_assert(static_cast<int>(DlssSrPerfQuality::kMaxPerf) == 0,
+                  "kMaxPerf must be 0");
+    static_assert(static_cast<int>(DlssSrPerfQuality::kBalanced) == 1,
+                  "kBalanced must be 1");
+    static_assert(static_cast<int>(DlssSrPerfQuality::kMaxQuality) == 2,
+                  "kMaxQuality must be 2");
+    static_assert(static_cast<int>(DlssSrPerfQuality::kUltraPerformance) == 3,
+                  "kUltraPerformance must be 3");
+    static_assert(static_cast<int>(DlssSrPerfQuality::kUltraQuality) == 4,
+                  "kUltraQuality must be 4 (the SDK header's value)");
+    static_assert(static_cast<int>(DlssSrPerfQuality::kDLAA) == 5,
+                  "kDLAA must be 5 (the SDK header's value)");
+    // The enum is uint8_t-backed so a plain cast to the SDK enum is safe.
+    static_assert(
+        std::is_same<decltype(static_cast<uint8_t>(
+                         DlssSrPerfQuality::kDLAA)), uint8_t>::value,
+        "DlssSrPerfQuality must be uint8_t-backed");
+  }
+
+  // 20. SelectOutputPath passes the new quality tiers (kUltraQuality, kDLAA) to
+  // the backend unchanged (like every other quality value).
+  TEST_CASE("SelectOutputPath passes the new quality tiers", "[enhancement]") {
+    GuestOutputEnhancementConfig config;
+    config.master_enabled = true;
+    config.super_sampling_enabled = true;
+    config.perf_quality = DlssSrPerfQuality::kUltraQuality;
+    StubBackend backend(BackendResult::kSuccess);
+    auto props = MakeActiveProperties();
+    Presenter::GuestOutputPaintFlow flow;
+    auto result =
+        SelectOutputPath(config, &backend, nullptr, nullptr, 0, 0, props,
+                         DlssSrFrameParams{}, &flow);
+    CHECK(result == BackendResult::kSuccess);
+    CHECK(backend.last_perf_quality_ == DlssSrPerfQuality::kUltraQuality);
+
+    GuestOutputEnhancementConfig dlaa_config;
+    dlaa_config.master_enabled = true;
+    dlaa_config.super_sampling_enabled = true;
+    dlaa_config.perf_quality = DlssSrPerfQuality::kDLAA;
+    StubBackend dlaa_backend(BackendResult::kSuccess);
+    Presenter::GuestOutputPaintFlow dlaa_flow;
+    auto dlaa_result =
+        SelectOutputPath(dlaa_config, &dlaa_backend, nullptr, nullptr, 0, 0,
+                         props, DlssSrFrameParams{}, &dlaa_flow);
+    CHECK(dlaa_result == BackendResult::kSuccess);
+    CHECK(dlaa_backend.last_perf_quality_ == DlssSrPerfQuality::kDLAA);
+  }
+
 }  // namespace ui
 }  // namespace xe

@@ -178,7 +178,7 @@ DEFINE_string(
     dlss_sr_perf_quality, "balanced",
     "DLSS Super Resolution quality preset. Only effective when dlss_sr_enabled "
     "is true. Use: [maxperf, balanced, maxquality, ultraperformance, "
-    "ultraperformance]\n"
+    "ultraquality, dlaa]\n"
     " maxperf:\n"
     "  Fastest preset, lowest quality.\n"
     " balanced (default):\n"
@@ -187,10 +187,15 @@ DEFINE_string(
     "  Highest quality of the standard presets.\n"
     " ultraperformance:\n"
     "  Extended fastest preset.\n"
+    " ultraquality:\n"
+    "  Extended highest-quality preset.\n"
+    " dlaa:\n"
+    "  DLSS anti-aliasing (1:1 resolution; no upscaling).\n"
     "Changing the preset rebuilds the DLSS backend (CreateFeature is a GPU "
     "command), which takes effect on the next frame. Unknown values (including "
-    "ultraquality, which the current DLSS runtime does not support) fall back "
-    "to balanced.",
+    "values that are not one of the listed names) fall back to balanced. If "
+    "initializing the backend with the selected preset fails, it "
+    "deterministically re-initializes with balanced (logged).",
     "Display");
   DEFINE_string(
       dlss_sr_render_preset, "default",
@@ -261,6 +266,10 @@ static const char* GetDlssSrPerfQualityName(ui::DlssSrPerfQuality quality) {
       return "MaxQuality";
     case ui::DlssSrPerfQuality::kUltraPerformance:
       return "UltraPerformance";
+    case ui::DlssSrPerfQuality::kUltraQuality:
+      return "UltraQuality";
+    case ui::DlssSrPerfQuality::kDLAA:
+      return "DLAA";
   }
   return "Balanced";
 }
@@ -627,7 +636,7 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
           ImGui::TextUnformatted(
               "DLSS SR quality preset (lower is faster, higher is higher "
               "quality; changing it rebuilds the DLSS backend):");
-          ImGui::SliderInt("##DLSSSrPerfQuality", &new_dlss_quality, 0, 3,
+          ImGui::SliderInt("##DLSSSrPerfQuality", &new_dlss_quality, 0, 5,
                            GetDlssSrPerfQualityName(
                                static_cast<ui::DlssSrPerfQuality>(
                                    new_dlss_quality)),
@@ -1340,6 +1349,10 @@ const char* EmulatorWindow::GetCvarValueForDlssSrPerfQuality(
       return "maxquality";
     case ui::DlssSrPerfQuality::kUltraPerformance:
       return "ultraperformance";
+    case ui::DlssSrPerfQuality::kUltraQuality:
+      return "ultraquality";
+    case ui::DlssSrPerfQuality::kDLAA:
+      return "dlaa";
   }
   return "balanced";
 }
@@ -1362,9 +1375,15 @@ ui::DlssSrPerfQuality EmulatorWindow::GetDlssSrPerfQualityForCvarValue(
       GetCvarValueForDlssSrPerfQuality(ui::DlssSrPerfQuality::kUltraPerformance)) {
     return ui::DlssSrPerfQuality::kUltraPerformance;
   }
+  if (cvar_value ==
+      GetCvarValueForDlssSrPerfQuality(ui::DlssSrPerfQuality::kUltraQuality)) {
+    return ui::DlssSrPerfQuality::kUltraQuality;
+  }
+  if (cvar_value ==
+      GetCvarValueForDlssSrPerfQuality(ui::DlssSrPerfQuality::kDLAA)) {
+    return ui::DlssSrPerfQuality::kDLAA;
+  }
   // Unknown value: fall back to the default preset (never a bogus value).
-  // "ultraquality" is unknown here on purpose: the current DLSS runtime does
-  // not support it, so a saved value of that name maps to balanced.
   return ui::DlssSrPerfQuality::kBalanced;
 }
 

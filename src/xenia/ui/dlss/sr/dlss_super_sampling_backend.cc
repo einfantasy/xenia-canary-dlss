@@ -211,6 +211,10 @@ const char* PerfQualityName(ui::DlssSrPerfQuality quality) {
       return "MaxQuality";
     case ui::DlssSrPerfQuality::kUltraPerformance:
       return "UltraPerformance";
+    case ui::DlssSrPerfQuality::kUltraQuality:
+      return "UltraQuality";
+    case ui::DlssSrPerfQuality::kDLAA:
+      return "DLAA";
   }
   return "Invalid";
 }
@@ -288,6 +292,10 @@ void DLSSSuperSamplingBackend::Shutdown() {
   input_height_ = 0;
   output_width_ = 0;
   output_height_ = 0;
+  quality_fallback_active_ = false;
+  fallback_from_quality_ = ui::DlssSrPerfQuality::kBalanced;
+  balanced_fallback_pending_ = false;
+  balanced_fallback_quality_ = ui::DlssSrPerfQuality::kBalanced;
   state_ = State::kNotInitialized;
 }
 
@@ -370,10 +378,9 @@ BackendResult DLSSSuperSamplingBackend::Initialize(
   // unavailable (no retry, per the lazy-init contract) and report the input
   // contract failure to the presenter. It is never clamped or silently passed
   // to the SDK.
-  if (static_cast<uint8_t>(perf_quality) > 3) {
-    XELOGW("DLSS SR: invalid quality preset {} (must be 0..3; UltraQuality is "
-           "not supported by the current DLSS runtime); caching the "
-           "backend as unavailable.",
+  if (static_cast<uint8_t>(perf_quality) > 5) {
+    XELOGW("DLSS SR: invalid quality preset {} (must be 0..5, the six SDK "
+           "quality tiers); caching the backend as unavailable.",
            static_cast<uint8_t>(perf_quality));
     state_ = State::kUnavailable;
     return BackendResult::kInputContractFailed;
@@ -627,6 +634,13 @@ BackendResult DLSSSuperSamplingBackend::Initialize(
           render_preset_param =
               NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance;
           break;
+        case ui::DlssSrPerfQuality::kUltraQuality:
+          render_preset_param =
+              NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality;
+          break;
+        case ui::DlssSrPerfQuality::kDLAA:
+          render_preset_param = NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA;
+          break;
       }
       if (render_preset_param) {
         NVSDK_NGX_Parameter_SetUI(
@@ -848,24 +862,21 @@ BackendResult DLSSSuperSamplingBackend::TryProcess(
     }
     return BackendResult::kInputContractFailed;
   }
-  // 1:1 bypass: the caller (presenter) should skip the backend in this case,
-  // but guard here as well.
-  if (input_width == output_width && input_height == output_height) {
-    if (!contract_failure_logged_) {
-      XELOGW("DLSS SR: input contract failed: 1:1 (input={}x{} == output={}x{}); "
-             "the presenter should have bypassed the backend.",
-             input_width, input_height, output_width, output_height);
-      contract_failure_logged_ = true;
-    }
-    return BackendResult::kInputContractFailed;
-  }
 
     // Lazy init / re-create on size, quality, or render-preset change.
   bool just_initialized = false;
+  // A quality change normally triggers a re-create, but while the Balanced
+  // fallback is active (the requested quality failed to initialize, so the
+  // feature was created with Balanced) a repeated request for the SAME
+  // quality must NOT re-create - otherwise the failed init + fallback would
+  // repeat every frame. Any OTHER quality change still re-creates as usual.
+  const bool quality_matches_created =
+      requested_quality == created_perf_quality_ ||
+      (quality_fallback_active_ && requested_quality == fallback_from_quality_);
   if (state_ == State::kNotInitialized ||
       input_width != input_width_ || input_height != input_height_ ||
       output_width != output_width_ || output_height != output_height_ ||
-        requested_quality != created_perf_quality_ ||
+        !quality_matches_created ||
         requested_render_preset != created_render_preset_) {
     if (state_ == State::kAvailable) {
         // Size, quality, or render preset changed: release the feature and
@@ -876,12 +887,75 @@ BackendResult DLSSSuperSamplingBackend::TryProcess(
       output_texture_.Reset();
       state_ = State::kNotInitialized;
     }
+    // A re-create invalidates any previous quality fallback: the feature is
+    // created with the requested quality below, and a fallback is
+    // re-established only if THAT creation fails.
+    quality_fallback_active_ = false;
+    // One-shot Balanced fallback: if the previous frame's Initialize failed
+    // with a non-Balanced quality, initialize with the Balanced tier now.
+    // The retry happens NEXT frame (not this frame) because the failed
+    // Initialize has already recorded zero-init commands into this command
+    // list; the presenter discards them (it resets the command list on a
+    // backend failure), so this Initialize records into a fresh command list.
+    ui::DlssSrPerfQuality init_quality = requested_quality;
+    if (balanced_fallback_pending_) {
+      if (requested_quality == balanced_fallback_quality_) {
+        balanced_fallback_pending_ = false;
+        init_quality = ui::DlssSrPerfQuality::kBalanced;
+      } else {
+        // The requested quality changed before the pending retry ran:
+        // discard the pending fallback (it applied to the old quality) and
+        // make a fresh attempt at the new quality.
+        balanced_fallback_pending_ = false;
+      }
+    }
     BackendResult init_result =
         Initialize(command_list, input_width, input_height, output_width,
-                     output_height, requested_quality,
+                     output_height, init_quality,
                      requested_render_preset);
     if (init_result != BackendResult::kSuccess) {
+      // Balanced fallback on initialization failure: the quality preset is
+      // a create-time parameter baked into CreateFeature, so an init failure
+      // with a non-Balanced quality (most commonly the SDK rejecting an
+      // unsupported quality tier) is retried with the Balanced tier - the
+      // default tier that is verified to work. The requested render preset is
+      // kept (it is legal for every quality mode). If the Balanced attempt
+      // also fails, that failure is reported and the backend is left exactly
+      // as Initialize left it (usually cached as unavailable, so the
+      // presenter falls back to the original path and no further retry
+      // happens).
+      if (init_quality == ui::DlssSrPerfQuality::kBalanced ||
+          init_result == BackendResult::kInputContractFailed) {
+        // Balanced itself failed (or the failure is a config/contract error,
+        // not an init error): nothing to fall back to.
+        return init_result;
+      }
+      XELOGW("DLSS SR: initialization with the {} quality preset failed "
+             "(result={}); falling back to the Balanced quality preset on the "
+             "next frame.",
+             PerfQualityName(requested_quality),
+             static_cast<int>(init_result));
+      // Initialize may have cached the backend as unavailable on a
+      // CreateFeature failure; the pending fallback needs the lazy-init
+      // block to run again next frame, so reset the state (a failure of the
+      // Balanced attempt re-caches unavailability - no further retries). Safe
+      // to reset: state_ is only ever touched on this presenter thread.
+      state_ = State::kNotInitialized;
+      balanced_fallback_pending_ = true;
+      balanced_fallback_quality_ = requested_quality;
       return init_result;
+    }
+    if (init_quality != requested_quality) {
+      // The pending Balanced fallback was applied: the feature was created
+      // with Balanced while the requested quality is still the one that
+      // failed. Remember that, so the lazy-init block above does not treat
+      // (requested != created) as a re-create trigger on the next frame.
+      quality_fallback_active_ = true;
+      fallback_from_quality_ = requested_quality;
+      XELOGI("DLSS SR: operating with the Balanced quality preset (the "
+             "requested {} quality preset failed to initialize; the fallback "
+             "is active).",
+             PerfQualityName(requested_quality));
     }
     // After a fresh Initialize the output texture is in UAV state, so the first
     // evaluate does not need a "to UAV" barrier.
