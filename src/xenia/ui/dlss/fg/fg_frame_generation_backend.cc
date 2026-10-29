@@ -534,6 +534,8 @@ BackendResult FGFrameGenerationBackend::Initialize(
   //    output_interp_ is the generated frame N-0.5; output_real_ is the SDK's
   //    copy of the real frame N. Both are R10G10B10A2_UNORM (the same format as
   //    the backbuffer).
+  // Captured by the lambda below; the first failing create writes its HRESULT.
+  HRESULT fg_output_create_hr = S_OK;
   auto create_output_tex = [&]() -> Microsoft::WRL::ComPtr<ID3D12Resource> {
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -546,10 +548,12 @@ BackendResult FGFrameGenerationBackend::Initialize(
     td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     Microsoft::WRL::ComPtr<ID3D12Resource> r;
-    if (FAILED(device_->CreateCommittedResource(
-            &kDefaultHeapProperties, D3D12_HEAP_FLAG_NONE, &td,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-            IID_PPV_ARGS(&r)))) {
+    const HRESULT create_hr = device_->CreateCommittedResource(
+        &kDefaultHeapProperties, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&r));
+    if (FAILED(create_hr)) {
+      fg_output_create_hr = create_hr;
       return nullptr;
     }
     return r;
@@ -557,10 +561,33 @@ BackendResult FGFrameGenerationBackend::Initialize(
   output_interp_ = create_output_tex();
   output_real_ = create_output_tex();
   if (!output_interp_ || !output_real_) {
-    XELOGE("FG: failed to create the backend output textures ({}x{}, "
-           "R10G10B10A2_UNORM, ALLOW_UNORDERED_ACCESS). Caching as "
+    // Same diagnostic as the SR branch: the ACTUAL HRESULT of this call plus
+    // the device-removal reason (0x887A0005 removed / 0x887A0007 hung /
+    // 0x80070057 E_INVALIDARG). The format-support query rules the R10G10B10A2
+    // typed-UAV format in or out without guessing.
+    const HRESULT device_removed_reason = device_->GetDeviceRemovedReason();
+    XELOGE("FG: failed to create the backend output textures: "
+           "create_hr=0x{:08X}, GetDeviceRemovedReason()=0x{:08X}, "
+           "desc(format=0x{:X}, flags=0x{:X}, width={}, height={}, "
+           "mip_levels=1, sample_count=1, layout=UNKNOWN), "
+           "initial_state=UNORDERED_ACCESS, heap=DEFAULT. Caching as "
            "unavailable.",
+           static_cast<uint32_t>(fg_output_create_hr),
+           static_cast<uint32_t>(device_removed_reason),
+           static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM),
+           static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
            color_width, color_height);
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {};
+    format_support.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    const HRESULT support_hr = device_->CheckFeatureSupport(
+        D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support));
+    XELOGE("FG: CheckFeatureSupport(hr=0x{:08X}) "
+           "Support1=0x{:X} Support2=0x{:X} typed_uav_supported={}",
+           static_cast<uint32_t>(support_hr),
+           static_cast<uint32_t>(format_support.Support1),
+           static_cast<uint32_t>(format_support.Support2),
+           (format_support.Support1 &
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0);
     state_ = State::kUnavailable;
     return BackendResult::kInitFailed;
   }

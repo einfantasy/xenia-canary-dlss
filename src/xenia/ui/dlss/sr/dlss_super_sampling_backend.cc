@@ -586,6 +586,14 @@ BackendResult DLSSSuperSamplingBackend::Initialize(
   g_ngx_device = device_;
   XELOGD("DLSS SR: core Acquire succeeded (core_initialized={}).",
          acquire_result.core_initialized);
+  {
+    const HRESULT dr = device_->GetDeviceRemovedReason();
+    if (FAILED(dr)) {
+      XELOGE("DLSS SR: device removed right after the core Acquire (NGX core "
+             "session init) (0x{:08X}).",
+             static_cast<uint32_t>(dr));
+    }
+  }
 
   // 3. Allocate the parameter block (CPU side).
   XELOGD("DLSS SR: AllocateParameters start.");
@@ -609,6 +617,13 @@ BackendResult DLSSSuperSamplingBackend::Initialize(
   parameter_block_->Set(NVSDK_NGX_Parameter_ResourceReleaseCallback,
                         reinterpret_cast<unsigned long long>(
                             &NGXResourceReleaseCallback));
+  {
+    const HRESULT dr = device_->GetDeviceRemovedReason();
+    if (FAILED(dr)) {
+      XELOGE("DLSS SR: device removed after AllocateParameters (0x{:08X}).",
+             static_cast<uint32_t>(dr));
+    }
+  }
 
     // Render preset hint (create-time, one value per quality mode). kDefault
     // means "do not send the hint at all": identical to the current verified
@@ -664,14 +679,44 @@ BackendResult DLSSSuperSamplingBackend::Initialize(
   output_desc.SampleDesc.Quality = 0;
   output_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   output_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-  if (FAILED(device_->CreateCommittedResource(
-          &kDefaultHeapProperties, D3D12_HEAP_FLAG_NONE, &output_desc,
-          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-          IID_PPV_ARGS(&output_texture_)))) {
+  const HRESULT sr_output_create_hr = device_->CreateCommittedResource(
+      &kDefaultHeapProperties, D3D12_HEAP_FLAG_NONE, &output_desc,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+      IID_PPV_ARGS(&output_texture_));
+  if (FAILED(sr_output_create_hr)) {
+    // The missing evidence: the ACTUAL HRESULT of this call. The 0x80070057
+    // earlier in the log is from a CreateRootSignature diagnostic, NOT this
+    // call. Distinguishing values:
+    //   0x887A0005 DXGI_ERROR_DEVICE_REMOVED -> device already removed
+    //   0x887A0007 DXGI_ERROR_DEVICE_HUNG    -> GPU hang / TDR
+    //   0x80070057 E_INVALIDARG              -> resource desc / format issue
+    const HRESULT device_removed_reason = device_->GetDeviceRemovedReason();
     XELOGE("DLSS SR: CreateCommittedResource for the backend output texture "
-           "failed ({}x{}, R10G10B10A2_UNORM, ALLOW_UNORDERED_ACCESS). "
-           "Caching as unavailable.",
-           output_width, output_height);
+           "failed: create_hr=0x{:08X}, GetDeviceRemovedReason()=0x{:08X}, "
+           "desc(format=0x{:X}, flags=0x{:X}, width={}, height={}, "
+           "mip_levels={}, sample_count={}, layout=0x{:X}), "
+           "initial_state=UNORDERED_ACCESS, heap=DEFAULT. Caching as "
+           "unavailable.",
+           static_cast<uint32_t>(sr_output_create_hr),
+           static_cast<uint32_t>(device_removed_reason),
+           static_cast<uint32_t>(output_desc.Format),
+           static_cast<uint32_t>(output_desc.Flags),
+           output_width, output_height, output_desc.MipLevels,
+           output_desc.SampleDesc.Count,
+           static_cast<uint32_t>(output_desc.Layout));
+    // Is R10G10B10A2_UNORM + typed UAV supported on this GPU? This rules the
+    // format in/out as the root cause without guessing.
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {};
+    format_support.Format = output_desc.Format;
+    const HRESULT support_hr = device_->CheckFeatureSupport(
+        D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support));
+    XELOGE("DLSS SR: CheckFeatureSupport(hr=0x{:08X}) "
+           "Support1=0x{:X} Support2=0x{:X} typed_uav_supported={}",
+           static_cast<uint32_t>(support_hr),
+           static_cast<uint32_t>(format_support.Support1),
+           static_cast<uint32_t>(format_support.Support2),
+           (format_support.Support1 &
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0);
     state_ = State::kUnavailable;
     return BackendResult::kInitFailed;
   }
@@ -861,6 +906,20 @@ BackendResult DLSSSuperSamplingBackend::TryProcess(
       contract_failure_logged_ = true;
     }
     return BackendResult::kInputContractFailed;
+  }
+
+  // Breadcrumb: is the device already removed when the SR TryProcess starts?
+  // This runs AFTER the NVOF TryProcess (frame 0 zero-fill). If it fires, the
+  // device was removed by the NVOF frame work (or earlier); if silent, the
+  // removal happens inside the SR init below.
+  {
+    const HRESULT dr = device_->GetDeviceRemovedReason();
+    if (FAILED(dr)) {
+      XELOGE("DLSS SR: device removed at the START of TryProcess (0x{:08X}) -- "
+             "removed by the NVOF frame work or an earlier GPU command, not by "
+             "the SR init.",
+             static_cast<uint32_t>(dr));
+    }
   }
 
     // Lazy init / re-create on size, quality, or render-preset change.

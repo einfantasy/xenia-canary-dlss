@@ -135,7 +135,19 @@ class NVOFOpticalFlowBackend final : public IOpticalFlowBackend {
   // capability check / init / registration fails; kInitFailed for other init
   // errors). Fail-closed: any caps mismatch is an input-contract failure, never
   // a silent fallback.
+  // `command_list` receives the first frame's conversion commands (execute +
+  // densify). `command_queue` is used to submit a one-time pre-registration
+  // zero-fill of frame_pool_[0]/frame_pool_[1] (a compute dispatch recorded on
+  // the backend-owned conversion command list, CPU-waited via a temporary
+  // fence) BEFORE the frame pool is registered with the NVOF SDK. This is the
+  // fix for the zf.3 driver crash: a per-frame zero-fill UAV binding of an
+  // already-registered SDK resource triggered an AV in nvwgf2umx.dll, so the
+  // resources must be zeroed before registration instead. Returns kSuccess, or
+  // a failure (kUnavailable when the capability check / init / registration
+  // fails; kInitFailed for other init errors). Fail-closed: any caps mismatch
+  // is an input-contract failure, never a silent fallback.
   BackendResult Initialize(ID3D12GraphicsCommandList* command_list,
+                           ID3D12CommandQueue* command_queue,
                            uint32_t frame_index);
   // Unregisters every registered resource from the NVOF session (reverse
   // order). The session MUST still be alive when this runs. Called by
@@ -146,6 +158,13 @@ class NVOFOpticalFlowBackend final : public IOpticalFlowBackend {
   // then FreeLibrary. Called by Shutdown() AFTER UnregisterResources() and
   // AFTER the backend-owned textures are released.
   void DestroySession();
+  // Binds the private view heap to the backend-owned conversion command list.
+  // SetDescriptorHeaps returns void (no HRESULT); correctness rests on the
+  // object-validity guard, the D3D12 Debug Layer, and runtime verification.
+  // Must be called after every Reset (Reset clears bound descriptor heaps) and
+  // after command-list creation. `stage` is a log tag distinguishing the two
+  // call sites (pre-zf vs per-frame conversion).
+  void BindViewHeap(const char* stage);
 
   ID3D12Device* device_;
   uint32_t input_width_;
@@ -179,21 +198,19 @@ class NVOFOpticalFlowBackend final : public IOpticalFlowBackend {
   Microsoft::WRL::ComPtr<ID3D12Resource> motion_vector_texture_;
   Microsoft::WRL::ComPtr<ID3D12Resource> confidence_texture_;
 
-  // Backend-owned zero-fill upload buffer (CPU-visible, filled with zeros).
-  // Used to zero-fill the ABGR8 previous frame on the first frame (so the NVOF
-  // reference is valid). Must stay alive for the backend's lifetime: the
-  // CopyTextureRegion that reads it is a GPU command executed at the end of the
-  // FIRST frame, AFTER Initialize() returns.
-  Microsoft::WRL::ComPtr<ID3D12Resource> zero_upload_buffer_;
-
-  // Backend-owned fences. input_fence_ is signaled by the caller to
-  // frame_index after the input frame is GPU-ready; the NVOF session waits on
-  // it before running. output_fence_ is set by the NVOF session when the flow
-  // is complete (an internal synchronization observed by the main command
-  // list; the caller does not wait on it directly).
+  // Backend-owned fences. Both are created at value 0 (a fence created at a
+  // value >= the first signal value makes that signal a no-op and the wait
+  // trivially satisfied - the input fence had exactly this bug class, fixed
+  // by signaling to frame_index + 1 instead of frame_index). input_fence_ is
+  // signaled (by the GPU, via the command queue) to frame_index + 1 after the
+  // submitted conversion/zero-fill work completes; the NVOF session waits on
+  // it before running. output_fence_ is signaled by the NVOF session to
+  // next_output_value_ when the execute completes; the backend CPU-waits on
+  // it (stage-C sync) before the densify reads the grid flow/cost.
   Microsoft::WRL::ComPtr<ID3D12Fence> input_fence_;
   Microsoft::WRL::ComPtr<ID3D12Fence> output_fence_;
-  // The next value to set on output_fence_ (starts at 1, increments per frame).
+  // The next value to signal output_fence_ to (starts at 1, increments per
+  // frame; strictly above the fence's start value 0, so every wait is real).
   uint64_t next_output_value_ = 1;
 
   // Backend-owned private view heap (CBV_SRV_UAV) and root signature, used by
@@ -201,8 +218,22 @@ class NVOFOpticalFlowBackend final : public IOpticalFlowBackend {
   // presenter's paint view heap (minimal-intrusion design).
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> view_heap_;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;
+  // Dedicated root signature for the conversion pass: a 1-wide SRV table (t0)
+  // and a 1-wide UAV table (u0). The shared root_signature_ has a 4-wide SRV
+  // table (t0-t3, shared with the densify pass); if the conversion pass used
+  // it, its SRV table range would span heap slots 0-3, which include the UAV
+  // descriptors at slots 1-2. The NVIDIA driver validates the whole SRV table
+  // range and raises a GPU fault on a UAV descriptor inside an SRV table.
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> conversion_rs_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> conversion_pso_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> densify_pso_;
+  // Dedicated root signature + PSO for the zero-fill pass (Phase A): a 1-wide
+  // UAV table (u0). The zero-fill compute dispatch writes zeros to the ABGR8
+  // previous frame (descriptor slot 9), replacing the old D2D CopyTextureRegion
+  // zero-fill (which transitioned a registered resource to COPY_DEST - the top
+  // suspect for the driver access violation).
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> zero_fill_rs_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> zero_fill_pso_;
 
   // Form-B orchestration (Milestone 4-E): the ABGR8 conversion pass is
   // recorded into a backend-owned command list (conversion_command_list_)
